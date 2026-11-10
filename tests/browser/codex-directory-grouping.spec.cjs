@@ -21,7 +21,7 @@ function sessionRows(host = 'local') {
 }
 
 async function installGateway(page) {
-  const model = {identity: 'a'.repeat(64), reads: [], writes: [], rows: sessionRows()};
+  const model = {identity: 'a'.repeat(64), reads: [], writes: [], rows: sessionRows(), providers: []};
   await page.route('**/api/**', async route => {
     const request = route.request(), url = new URL(request.url()), pathname = url.pathname;
     const output = data => route.fulfill({status: 200, contentType: 'application/json', body: JSON.stringify(data)});
@@ -35,7 +35,15 @@ async function installGateway(page) {
     if (pathname === '/api/clients') return output({clients: [
       {id: 'codex', name: 'Codex', enabled: true, installed: true, configured: true, connected: true},
       {id: entryId, name: '独立 Codex', kind: 'codex-local', enabled: true, installed: true, configured: true, connected: true},
+      ...model.providers.map(id => ({id, name: id === 'claude' ? 'Claude' : 'DSH',
+        enabled: true, installed: true, configured: true, connected: true})),
     ]});
+    if (/^\/api\/desktop-sessions\/(claude|deepseek)\/list$/.test(pathname)) {
+      return output({connected: true, sessions: ['code', 'cowork', 'cli'].map((backend, index) => ({
+        id: 'toolbar-' + backend, title: 'Synthetic toolbar ' + backend, backend,
+        cwd: '/work/toolbar', updatedAt: 200000 - index,
+      }))});
+    }
     if (pathname === '/api/sessions') {
       const host = url.searchParams.get('host') || 'local', source = url.searchParams.get('source') || 'all';
       const query = url.searchParams.get('q') || '', order = url.searchParams.get('order');
@@ -240,15 +248,37 @@ test('Codex directory mode distinguishes old metadata from a genuinely missing w
   expect(model.writes).toEqual([]);
 });
 
-async function toolbarGeometry(page) {
+async function toolbarGeometry(page, root = '#sidebar') {
   await page.evaluate(() => new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve))));
-  return page.evaluate(() => Object.fromEntries([
-    ['toolbar', '#sidebar .chat-list-toolbar'], ['search', '#search'],
-    ['filters', '#sidebar .list-filters'], ['mode', '#list-mode'], ['source', '#source-filter'],
-  ].map(([name, selector]) => {
-    const rect = document.querySelector(selector).getBoundingClientRect();
-    return [name, {x: rect.x, y: rect.y, width: rect.width, height: rect.height}];
-  })));
+  return page.evaluate(root => {
+    const container = document.querySelector(root);
+    return Object.fromEntries([
+      ['toolbar', '.chat-list-toolbar'], ['search', '.chat-list-toolbar > .search'],
+      ['filters', '.list-filters'], ['mode', '.list-mode select:not(#source-filter)'],
+      ['source', '#source-filter, .ds-surface'], ['archive', '.archive'],
+    ].flatMap(([name, selector]) => {
+      const node = container.querySelector(selector);
+      if (!node || !node.getClientRects().length) return [];
+      const rect = node.getBoundingClientRect();
+      return [[name, {x: rect.x, y: rect.y, width: rect.width, height: rect.height}]];
+    }));
+  }, root);
+}
+
+function expectSingleRow(geometry, context) {
+  const {toolbar, search, mode, archive} = geometry;
+  expect(search, `${context}: search is visible`).toBeTruthy();
+  expect(mode, `${context}: display mode is visible`).toBeTruthy();
+  expect(archive, `${context}: archive is visible`).toBeTruthy();
+  expect(Math.abs(toolbar.height - 36), `${context}: toolbar must stay one row; ${JSON.stringify(geometry)}`)
+    .toBeLessThanOrEqual(1);
+  expect(search.width, `${context}: search remains usable`).toBeGreaterThanOrEqual(43);
+  for (const [name, rect] of Object.entries(geometry)) {
+    expect(Math.abs(rect.y - toolbar.y), `${context}: ${name} shares the toolbar row`).toBeLessThanOrEqual(1);
+    expect(rect.x, `${context}: ${name} stays within toolbar left edge`).toBeGreaterThanOrEqual(toolbar.x - 1);
+    expect(rect.x + rect.width, `${context}: ${name} stays within toolbar right edge`)
+      .toBeLessThanOrEqual(toolbar.x + toolbar.width + 1);
+  }
 }
 
 function expectSameToolbar(before, after, context) {
@@ -260,28 +290,34 @@ function expectSameToolbar(before, after, context) {
   }
 }
 
-test('Codex toolbar keeps its row when directory mode changes', async ({page}) => {
-  const model = await installGateway(page);
-  await ready(page);
-  for (const language of ['zh', 'en']) {
+for (const language of ['zh', 'en']) {
+  test(`Codex toolbar keeps a single row in ${language} when directory mode changes`, async ({page}) => {
+    const model = await installGateway(page);
+    await ready(page);
     await page.evaluate(language => BridgeI18n.setLanguage(language), language);
-    for (const width of [1280, 320, 390]) {
-      await page.setViewportSize({width, height: 900});
+    for (const width of language === 'zh' ? [1280, 320, 390, 844, 1440] : [320, 1280, 390, 844, 1440]) {
+      await page.setViewportSize({width, height: width === 844 ? 390 : 900});
       await page.selectOption('#list-mode', 'recent');
+      await expect(page.locator('#source-filter option[value="all"]')).toHaveText(language === 'zh' ? '全部会话' : 'All');
       const before = await toolbarGeometry(page);
+      expectSingleRow(before, `${language}/${width}/recent`);
       for (const mode of ['project', 'directory', 'recent']) {
         await page.selectOption('#list-mode', mode);
-        expectSameToolbar(before, await toolbarGeometry(page), `${language}/${width}/${mode}`);
+        const after = await toolbarGeometry(page);
+        expectSingleRow(after, `${language}/${width}/${mode}`);
+        expectSameToolbar(before, after, `${language}/${width}/${mode}`);
       }
       for (const source of ['cli', 'ide', 'desktop', 'all']) {
         await page.selectOption('#source-filter', source);
-        expectSameToolbar(before, await toolbarGeometry(page), `${language}/${width}/${source}`);
+        const after = await toolbarGeometry(page);
+        expectSingleRow(after, `${language}/${width}/${source}`);
+        expectSameToolbar(before, after, `${language}/${width}/${source}`);
       }
       expect(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth + 1)).toBe(true);
     }
-  }
-  expect(model.writes).toEqual([]);
-});
+    expect(model.writes).toEqual([]);
+  });
+}
 
 test('Codex toolbar updates sizing for changed options and larger localized text', async ({page}) => {
   const model = await installGateway(page);
@@ -290,25 +326,74 @@ test('Codex toolbar updates sizing for changed options and larger localized text
   await page.evaluate(() => BridgeI18n.setLanguage('en'));
   await page.selectOption('#list-mode', 'project');
   await expect(page.locator('#source-filter option[value="all"]')).toHaveText('All');
-  const initial = await toolbarGeometry(page);
+  expectSingleRow(await toolbarGeometry(page), 'localized/initial');
   await page.evaluate(() => {
     // Models a later source-label update after the toolbar has already bound.
     document.querySelector('#source-filter option[value="all"]').textContent = 'All workspace sessions';
   });
-  await expect.poll(async () => (await toolbarGeometry(page)).source.width).toBeGreaterThan(initial.source.width);
+  await expect(page.locator('#source-filter option[value="all"]')).toHaveText('All workspace sessions');
   const updated = await toolbarGeometry(page);
+  expectSingleRow(updated, 'late option/all');
   await page.selectOption('#source-filter', 'ide');
   expectSameToolbar(updated, await toolbarGeometry(page), 'late option/ide');
   await page.selectOption('#source-filter', 'all');
+  await expect(page.locator('#source-filter')).toHaveValue('all');
+  await expect(page.locator('#source-filter option:checked')).toHaveText('All workspace sessions');
 
   await page.evaluate(() => {
     for (const select of document.querySelectorAll('#sidebar .chat-list-toolbar select')) select.style.fontSize = '18px';
   });
   await page.setViewportSize({width: 400, height: 844});
+  await expect(page.locator('#list-mode')).toHaveCSS('font-size', '18px');
   const enlarged = await toolbarGeometry(page);
-  expect(enlarged.mode.width).toBeGreaterThan(updated.mode.width);
+  expectSingleRow(enlarged, 'enlarged/project');
   await page.selectOption('#list-mode', 'directory');
-  expectSameToolbar(enlarged, await toolbarGeometry(page), 'enlarged/directory');
+  await expect(page.locator('#list-mode')).toHaveValue('directory');
+  await expect(page.locator('#list-mode option:checked')).toHaveText('Working directory');
+  const selected = await toolbarGeometry(page);
+  expectSingleRow(selected, 'enlarged/directory');
+  expectSameToolbar(enlarged, selected, 'enlarged/directory');
   expect(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth + 1)).toBe(true);
+  expect(model.writes).toEqual([]);
+});
+
+test('Claude and DSH share the single-row toolbar in their actual list views', async ({page}) => {
+  const model = await installGateway(page);
+  model.providers = ['claude', 'deepseek'];
+  await ready(page);
+  const root = '.desktop-sessions .ds-list';
+  const mode = page.locator(root + ' .list-mode select');
+  const source = page.locator(root + ' .ds-surface');
+  for (const provider of model.providers) {
+    await page.locator(`#client-switch [data-client-id="${provider}"]`).click();
+    await expect(page.locator(root + ' .session')).toHaveCount(3);
+    if (provider === 'claude') await expect(source).toBeVisible();
+    else await expect(source).toBeHidden();
+    for (const language of ['zh', 'en']) {
+      await page.evaluate(language => BridgeI18n.setLanguage(language), language);
+      for (const width of [1280, 320, 390, 844, 1440]) {
+        await page.setViewportSize({width, height: width === 844 ? 390 : 900});
+        await mode.selectOption('recent');
+        const before = await toolbarGeometry(page, root);
+        const context = `${provider}/${language}/${width}`;
+        expectSingleRow(before, context);
+        for (const value of ['project', 'recent']) {
+          await mode.selectOption(value);
+          const after = await toolbarGeometry(page, root);
+          expectSingleRow(after, `${context}/${value}`);
+          expectSameToolbar(before, after, `${context}/${value}`);
+        }
+        if (provider === 'claude') {
+          for (const value of ['code', 'cowork', 'cli', 'all']) {
+            await source.selectOption(value);
+            const after = await toolbarGeometry(page, root);
+            expectSingleRow(after, `${context}/${value}`);
+            expectSameToolbar(before, after, `${context}/${value}`);
+          }
+        }
+        expect(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth + 1)).toBe(true);
+      }
+    }
+  }
   expect(model.writes).toEqual([]);
 });

@@ -14,7 +14,7 @@ function bindChatListToolbar(toolbar){
         measure.textContent=option.label||option.textContent||'';
         width=Math.max(width,measure.getBoundingClientRect().width);
       }
-      // Reserve every choice and the native arrow so selection cannot wrap the toolbar.
+      // Prefer the longest choice plus the native arrow; CSS can shrink it to fit the row.
       select.style.width=Math.ceil(width+30)+'px';
     }
   };
