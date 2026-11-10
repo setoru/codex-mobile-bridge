@@ -9,12 +9,21 @@ function bindChatListToolbar(toolbar){
       const style=getComputedStyle(select);
       measure.style.font=style.font;
       measure.style.letterSpacing=style.letterSpacing;
-      measure.textContent=select.selectedOptions[0]?.textContent||'';
-      // Reserve the native arrow and its spacing; only the selected label determines width.
-      select.style.width=Math.ceil(measure.getBoundingClientRect().width+30)+'px';
+      let width=0;
+      for(const option of select.options){
+        measure.textContent=option.label||option.textContent||'';
+        width=Math.max(width,measure.getBoundingClientRect().width);
+      }
+      // Reserve every choice and the native arrow so selection cannot wrap the toolbar.
+      select.style.width=Math.ceil(width+30)+'px';
     }
   };
   const later=()=>requestAnimationFrame(update);
+  if(typeof MutationObserver!=='undefined'){
+    const optionsObserver=new MutationObserver(later);
+    for(const select of selects)optionsObserver.observe(select,{childList:true,subtree:true,characterData:true,attributes:true,attributeFilter:['label']});
+  }
+  document.fonts?.ready?.then(later);
   toolbar.addEventListener('change',update);
   document.addEventListener('bridge-language',later);
   window.addEventListener('resize',update);

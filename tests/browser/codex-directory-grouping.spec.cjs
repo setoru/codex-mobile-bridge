@@ -239,3 +239,76 @@ test('Codex directory mode distinguishes old metadata from a genuinely missing w
   await expect(page.locator('#sessions .session')).toHaveCount(3);
   expect(model.writes).toEqual([]);
 });
+
+async function toolbarGeometry(page) {
+  await page.evaluate(() => new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve))));
+  return page.evaluate(() => Object.fromEntries([
+    ['toolbar', '#sidebar .chat-list-toolbar'], ['search', '#search'],
+    ['filters', '#sidebar .list-filters'], ['mode', '#list-mode'], ['source', '#source-filter'],
+  ].map(([name, selector]) => {
+    const rect = document.querySelector(selector).getBoundingClientRect();
+    return [name, {x: rect.x, y: rect.y, width: rect.width, height: rect.height}];
+  })));
+}
+
+function expectSameToolbar(before, after, context) {
+  for (const key of Object.keys(before)) {
+    for (const dimension of ['x', 'y', 'width', 'height']) {
+      expect(Math.abs(before[key][dimension] - after[key][dimension]),
+        `${context}: ${key}.${dimension}`).toBeLessThanOrEqual(1);
+    }
+  }
+}
+
+test('Codex toolbar keeps its row when directory mode changes', async ({page}) => {
+  const model = await installGateway(page);
+  await ready(page);
+  for (const language of ['zh', 'en']) {
+    await page.evaluate(language => BridgeI18n.setLanguage(language), language);
+    for (const width of [1280, 320, 390]) {
+      await page.setViewportSize({width, height: 900});
+      await page.selectOption('#list-mode', 'recent');
+      const before = await toolbarGeometry(page);
+      for (const mode of ['project', 'directory', 'recent']) {
+        await page.selectOption('#list-mode', mode);
+        expectSameToolbar(before, await toolbarGeometry(page), `${language}/${width}/${mode}`);
+      }
+      for (const source of ['cli', 'ide', 'desktop', 'all']) {
+        await page.selectOption('#source-filter', source);
+        expectSameToolbar(before, await toolbarGeometry(page), `${language}/${width}/${source}`);
+      }
+      expect(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth + 1)).toBe(true);
+    }
+  }
+  expect(model.writes).toEqual([]);
+});
+
+test('Codex toolbar updates sizing for changed options and larger localized text', async ({page}) => {
+  const model = await installGateway(page);
+  await ready(page);
+  await page.setViewportSize({width: 390, height: 844});
+  await page.evaluate(() => BridgeI18n.setLanguage('en'));
+  await page.selectOption('#list-mode', 'project');
+  await expect(page.locator('#source-filter option[value="all"]')).toHaveText('All');
+  const initial = await toolbarGeometry(page);
+  await page.evaluate(() => {
+    // Models a later source-label update after the toolbar has already bound.
+    document.querySelector('#source-filter option[value="all"]').textContent = 'All workspace sessions';
+  });
+  await expect.poll(async () => (await toolbarGeometry(page)).source.width).toBeGreaterThan(initial.source.width);
+  const updated = await toolbarGeometry(page);
+  await page.selectOption('#source-filter', 'ide');
+  expectSameToolbar(updated, await toolbarGeometry(page), 'late option/ide');
+  await page.selectOption('#source-filter', 'all');
+
+  await page.evaluate(() => {
+    for (const select of document.querySelectorAll('#sidebar .chat-list-toolbar select')) select.style.fontSize = '18px';
+  });
+  await page.setViewportSize({width: 400, height: 844});
+  const enlarged = await toolbarGeometry(page);
+  expect(enlarged.mode.width).toBeGreaterThan(updated.mode.width);
+  await page.selectOption('#list-mode', 'directory');
+  expectSameToolbar(enlarged, await toolbarGeometry(page), 'enlarged/directory');
+  expect(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth + 1)).toBe(true);
+  expect(model.writes).toEqual([]);
+});
