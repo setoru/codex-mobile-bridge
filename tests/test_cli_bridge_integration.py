@@ -834,6 +834,32 @@ class CliDiagnosticsHttpTests(CliBridgeFixture):
         self.assertEqual(self.request('GET', '/api/sessions/diagnostics?thread=not-a-uuid',
                                       headers={'Cookie': cookie})[0], 400)
 
+    def test_directory_metadata_is_authenticated_and_stable_across_list_pages(self):
+        with closing(sqlite3.connect(self.home / 'state_5.sqlite')) as db, db:
+            db.executemany('INSERT INTO threads(id,title,cwd,updated_at,archived,originator,source) VALUES(?,?,?,?,?,?,?)',
+                          [(f'page-{index:03}', 'Paged', '/work/shop' if index % 2 else '/other/shop',
+                            200-index, 0, 'codex_cli_rs', 'cli') for index in range(120)])
+        route = '/api/sessions?scope=host&host=local&order=project'
+        self.assertEqual(self.request('GET', route)[0], 401)
+        status, headers, _ = self.request('POST', '/api/login',
+                                         {'username': 'admin', 'password': 'integration password'})
+        self.assertEqual(status, 200)
+        auth = {'Cookie': headers['Set-Cookie'].split(';')[0]}
+        status, _, first = self.request('GET', route, headers=auth)
+        self.assertEqual(status, 200)
+        status, _, second = self.request('GET', route + '&offset=100', headers=auth)
+        self.assertEqual(status, 200)
+        self.assertEqual(len(first['sessions']), 101)
+        self.assertEqual(len(second['sessions']), 121)
+        self.assertEqual(first['sessions'], second['sessions'][:101])
+        groups = {row['directoryGroup']['key'] for row in second['sessions'] if row['title'] == 'Paged'}
+        self.assertEqual(len(groups), 2)
+        self.assertTrue(all(row['projectKey'] == 'local|unassigned' for row in second['sessions']))
+        self.assertTrue(all('_targetPathStyle' not in row for row in second['sessions']))
+        self.cli.attach.assert_not_called()
+        self.cli.call.assert_not_called()
+        self.bridge.ipc.connect.assert_not_called()
+
     def test_reconnect_route_requires_csrf_and_only_explicit_activate_joins_cli(self):
         status, headers, login = self.request('POST', '/api/login',
             {'username': 'admin', 'password': 'integration password'})

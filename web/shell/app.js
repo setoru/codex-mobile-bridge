@@ -117,7 +117,7 @@ function refreshEntryAccounts(){
   accountsPanel?.clear();if($('accounts-dialog').open){renderAccountEntries();refreshSelectedAccounts();}
 }
 clientNavigation.onApplicationChange=(previous,provider,{host,loadList:readList=true}={})=>{
-  if(provider==='codex')selectedCodexEntry=host?.startsWith('codex:')?host:null;
+  if(provider==='codex'){selectedCodexEntry=host?.startsWith('codex:')?host:null;restoreListMode();}
   if(host?.startsWith('codex:')){preferredWslEntry=host;listSource='all';}
   if(host?.startsWith('wsl:')){preferredWslEntry=host;listSource='wsl';localStorage.setItem('codex-source-filter',listSource);}
   listGeneration++;saveDraft();if(host==='local'||isCodexEntry(host))currentHost=host;listRows=[];availableSources=[];listOffset=0;listHasMore=true;listComplete=false;listReadFinished=false;listFilterKey='';listRenderStamp='';sourceFilterStamp='';
@@ -214,6 +214,7 @@ async function enter(authInfo){
   desktopSessions.bindDraftGateway?.(draftGateway);
   listIdentity=await listAuthIdentity(verified);
   desktopSessions.bindListCache(listIdentity,window.BridgeRelayBase||location.host);
+  restoreListMode();
   restoreListSnapshot();
   const target=clientNavigation.chatTarget?.(chatLink),direct=!!target&&Array.isArray(verified.enabledClients);
   clientNavigation.enabledClients=Array.isArray(verified.enabledClients)?verified.enabledClients.slice():null;
@@ -242,6 +243,16 @@ $('logout').onclick=async()=>{await api('/api/logout',{});hideWebhookUrl();docum
 function dateText(value){if(!value)return '';return new Date(value*1000).toLocaleDateString(BridgeI18n.locale(),{month:'numeric',day:'numeric'});}
 function listAuthIdentity(auth){return auth?.authenticated&&/^[0-9a-f]{64}$/.test(auth.listCacheIdentity||'')?auth.listCacheIdentity:'';}
 function listSnapshotKey(filter){return listIdentity?'codex-list-v1:'+listIdentity+':'+filter:'';}
+function listModePreferenceKey(){return listIdentity?'codex-list-mode-v1:'+JSON.stringify([listIdentity,selectedCodexEntry||'codex']):'';}
+function restoreListMode(){
+  let mode='recent';
+  try{
+    const key=listModePreferenceKey(),saved=key?localStorage.getItem(key):null,legacy=localStorage.getItem('list-mode'),value=saved??legacy;
+    if(['recent','project','directory'].includes(value))mode=value;
+    if(key&&saved===null&&legacy!==null)localStorage.setItem(key,mode);
+  }catch{}
+  $('list-mode').value=mode;
+}
 function currentListFilter(){
   const fields=[$('search').value,$('archived').checked,listSource,$('list-mode').value];
   if(selectedCodexEntry)fields.push(selectedCodexEntry);
@@ -257,6 +268,7 @@ function restoreListSnapshot(filter=currentListFilter()){
       if(!value||!Array.isArray(value.rows)||value.rows.length>200||!value.rows.every(row=>row&&typeof row.id==='string'&&typeof row.host==='string')||
           !Array.isArray(value.sources)||!value.sources.every(source=>typeof source==='string')||
           !Array.isArray(value.hosts)||!value.hosts.every(host=>typeof host==='string'))continue;
+      if(JSON.parse(filter)[3]==='directory'&&!value.rows.every(hasDirectoryGroup))continue;
       saved=value;legacy=storage===sessionStorage;break;
     }catch{}
   }
@@ -275,8 +287,8 @@ function saveListSnapshot(filter){
     for(const old of keys.slice(0,-7))localStorage.removeItem(old);
   }catch{try{sessionStorage.setItem(key,snapshot);}catch{}}
 }
-$('list-mode').value=localStorage.getItem('list-mode')||'recent';
-$('list-mode').onchange=()=>{localStorage.setItem('list-mode',$('list-mode').value);loadList(true).catch(e=>toast(e.message));};
+restoreListMode();
+$('list-mode').onchange=()=>{const key=listModePreferenceKey();if(key){try{localStorage.setItem(key,$('list-mode').value);}catch{}}return loadList(true).catch(e=>toast(e.message));};
 listSource=clientNavigation.initialHost?.startsWith('wsl:')?'wsl':localStorage.getItem('codex-source-filter')||'all';
 if(!['all','desktop','cli','ide','wsl'].includes(listSource))listSource='all';
 $('source-filter').onchange=()=>{listSource=$('source-filter').value;localStorage.setItem('codex-source-filter',listSource);return loadList(true).catch(e=>toast(e.message));};
@@ -304,39 +316,51 @@ function currentAccess(){return sessionAccess(state?.access||listRows.find(row=>
 function sourceLabel(access){return access?.runtime==='wsl'?'WSL':access?.source==='cli'?'CLI':access?.source==='ide'?'VS Code':access?.source==='unknown'?t('其他来源'):'APP';}
 function renderList(){
   const displayedRows=listRows.map(row=>pinRow(row));
-  const stamp=JSON.stringify([$('list-mode').value,currentId,currentHost,listHasMore,BridgeI18n.locale(),availableSources,listRows.length?null:[listComplete,listReadFinished],displayedRows.map(row=>[row.id,row.host,row.title,row.projectKey,row.projectName,row.hostLabel,row.recency,row.bridgePinned,row.pinPending,row.archived,row.access,row.orphanedSideChat])]);
+  const directory=$('list-mode').value==='directory';
+  const availableRows=directory?displayedRows.filter(hasDirectoryGroup):displayedRows,missingMetadata=availableRows.length!==displayedRows.length;
+  const stamp=JSON.stringify([$('list-mode').value,currentId,currentHost,listHasMore,BridgeI18n.locale(),availableSources,directory?[listIdentity,selectedCodexEntry,missingMetadata?listReadFinished:null]:null,listRows.length?null:[listComplete,listReadFinished],displayedRows.map(row=>[row.id,row.host,row.title,row.projectKey,row.projectName,row.directoryGroup,row.hostLabel,row.recency,row.bridgePinned,row.pinPending,row.archived,row.access,row.orphanedSideChat])]);
   if(stamp===listRenderStamp&&$('sessions').children.length){renderActivity();return;}
   listRenderStamp=stamp;
   const scrollTop=$('sessions').scrollTop;
   $('sessions').replaceChildren();
-  const grouped=$('list-mode').value==='project', groups=new Map();
+  const grouped=directory||$('list-mode').value==='project', groups=new Map();
   let pinSection=null;
-  const unassigned=chat=>chat.projectKey===(chat.host||'local')+'|unassigned';
-  const ordered=grouped?[...displayedRows].sort((a,b)=>Number(unassigned(a))-Number(unassigned(b))||(b.recency-a.recency)||b.id.localeCompare(a.id)):[...displayedRows].sort((a,b)=>Number(!!b.bridgePinned)-Number(!!a.bridgePinned)||(b.recency-a.recency)||b.id.localeCompare(a.id));
+  const unassigned=chat=>directory?chat.directoryGroup.missing:chat.projectKey===(chat.host||'local')+'|unassigned';
+  if(missingMetadata)$('sessions').append(el('p','muted directory-group-notice',t(listReadFinished?'部分接入暂不支持按工作目录分类，请切换显示方式。':'正在读取工作目录…')));
+  const ordered=grouped?[...availableRows].sort((a,b)=>Number(unassigned(a))-Number(unassigned(b))||(b.recency-a.recency)||b.id.localeCompare(a.id)||a.host.localeCompare(b.host)):[...availableRows].sort((a,b)=>Number(!!b.bridgePinned)-Number(!!a.bridgePinned)||(b.recency-a.recency)||b.id.localeCompare(a.id));
   const hasPins=!grouped&&ordered.some(chat=>chat.bridgePinned);
   for(const chat of ordered){
     let parent=$('sessions');
+    const groupKey=directory?chat.directoryGroup.key:chat.projectKey,groupName=directory?(chat.directoryGroup.missing?t('无工作目录'):chat.directoryGroup.name):chat.projectName;
     if(hasPins&&pinSection!==!!chat.bridgePinned){pinSection=!!chat.bridgePinned;const label=el('h3','muted',t(pinSection?'置顶聊天':'最近聊天'));$('sessions').append(label);}
     if(grouped){
-      if(!groups.has(chat.projectKey)){
+      if(!groups.has(groupKey)){
         const details=el('details','project-group');
-        details.open=localStorage.getItem('group:'+chat.projectKey)!=='closed';
-        details.append(el('summary','',chat.projectName+' · '+(chat.host==='local'?t('此电脑'):chat.hostLabel)));
-        details.ontoggle=()=>localStorage.setItem('group:'+chat.projectKey,details.open?'open':'closed');
-        groups.set(chat.projectKey,details);$('sessions').append(details);
+        const storageKey=directory?'directory-group-v1:'+JSON.stringify([listIdentity,selectedCodexEntry||'codex',groupKey]):'group:'+groupKey;
+        details.open=localStorage.getItem(storageKey)!=='closed';
+        const summary=el('summary','',groupName+' · '+(chat.host==='local'?t('此电脑'):chat.hostLabel));
+        if(directory&&chat.directoryGroup.path)summary.append(el('span','directory-group-path',chat.directoryGroup.path));
+        details.append(summary);
+        details.ontoggle=()=>{if(details.isConnected)localStorage.setItem(storageKey,details.open?'open':'closed');};
+        groups.set(groupKey,details);$('sessions').append(details);
       }
-      parent=groups.get(chat.projectKey);
+      parent=groups.get(groupKey);
     }
     const button=el('button','session'+(chat.id===currentId&&chat.host===currentHost?' selected':''));
     button.dataset.id=chat.id;button.dataset.host=chat.host;
     button.append(el('strong','',chat.title));
     button.append(el('span','session-source',sourceLabel(sessionAccess(chat.access))||t('其他来源')));
-    const meta=el('small');meta.append(el('span','',(chat.orphanedSideChat?t('侧边聊天（主聊天不可用）')+' · ':'')+chat.projectName+' · '+(chat.host==='local'?t('此电脑'):chat.hostLabel)),el('time','',dateText(chat.recency/1000)));
+    const meta=el('small');meta.append(el('span','',(chat.orphanedSideChat?t('侧边聊天（主聊天不可用）')+' · ':'')+groupName+' · '+(chat.host==='local'?t('此电脑'):chat.hostLabel)),el('time','',dateText(chat.recency/1000)));
     if(chat.pinPending)button.append(el('span','session-source',t('置顶设置待同步')));
     button.append(meta);button.onclick=()=>openChat(chat.id,chat.host).catch(e=>toast(e.message));bindSessionMenu(button,chat);parent.append(button);
   }
   if(listHasMore){const more=el('button','plain',t('加载更多聊天'));more.id='sessions-more';more.type='button';more.onclick=()=>loadList().catch(error=>toast(error.message));$('sessions').append(more);}
   if(!listRows.length)$('sessions').append(el('p','muted',t(listComplete?'没有找到聊天。':listReadFinished?'暂不可用':'正在读取…')));renderActivity();$('sessions').scrollTop=scrollTop;
+}
+function hasDirectoryGroup(row){
+  const group=row?.directoryGroup;
+  return !!group&&typeof group.key==='string'&&!!group.key&&
+    (group.missing===true&&group.name===null&&group.path===null||group.missing===false&&typeof group.name==='string'&&!!group.name&&typeof group.path==='string'&&!!group.path);
 }
 let sharedSessionMenu;
 function getSessionMenu(){return sharedSessionMenu||(sharedSessionMenu=new SessionMenu({translate:t,notify:toast,newId:uuid}));}
@@ -476,7 +500,7 @@ async function loadList(reset=false){
     return merged;
   };
   const read=async host=>{
-    const url='/api/sessions?scope=host&host='+encodeURIComponent(host)+'&q='+encodeURIComponent(query)+'&offset='+(targetCount-100)+'&archived='+archived+'&source='+source+'&order='+encodeURIComponent(mode);
+    const url='/api/sessions?scope=host&host='+encodeURIComponent(host)+'&q='+encodeURIComponent(query)+'&offset='+(targetCount-100)+'&archived='+archived+'&source='+source+'&order='+(mode==='recent'?'recent':'project');
     try{
       const result=await api(url);if(generation!==listGeneration)return null;
       if(host==='local'){

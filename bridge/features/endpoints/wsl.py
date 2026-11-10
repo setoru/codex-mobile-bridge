@@ -22,6 +22,7 @@ from bridge.features.accounts.draft_identity import draft_identity
 from bridge.features.sessions.model import normalize_state, normalize_request, computer_use_approval
 from bridge.features.sessions.timeline import Timeline
 from bridge.features.sessions.store import StoreUnavailable
+from bridge.features.sessions.directory_grouping import directory_group
 from bridge.features.sessions.archive import ArchiveCommands
 from bridge.features.sessions.organization_commands import OrganizationCommands
 from bridge.features.sessions.compaction import CompactCommands
@@ -352,6 +353,8 @@ class WslEntry(WslFeatures):
             **({'pinned_ids': sorted(pins)} if pin_order else {}))
         for row in rows:
             cwd = row.get('cwd') or ''
+            row['directoryGroup'] = directory_group(row.get('cwd'), scope=('codex', self.host),
+                                                    target_path_style='posix')
             row.update(host=self.host, endpointId=self.host, hostLabel=self.row['label'],
                        title=row.get('name') or row.get('display_title') or row.get('title') or '未命名聊天',
                        projectKey=self.host + '|' + cwd, projectName=cwd.rstrip('/').rsplit('/', 1)[-1] or '未归类',

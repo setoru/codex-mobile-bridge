@@ -3,12 +3,12 @@ const test=require('node:test'),assert=require('node:assert/strict'),fs=require(
 const source=fs.readFileSync(path.join(__dirname,'../web/shell/app.js'),'utf8');
 const code=source.slice(source.indexOf('function renderList(){'),source.indexOf('async function loadList('));
 function fixture(){
- const nodes=new Map(),timers=new Map(),requests=[],dialogs=[],copies=[];let timer=0;
+ const nodes=new Map(),timers=new Map(),requests=[],dialogs=[],copies=[],storage=new Map();let timer=0;
  const node=(tag='',cls='',textContent='')=>({tag,cls,textContent,dataset:{},classList:{add(){}},children:[],events:{},scrollTop:0,isConnected:true,append(...items){this.children.push(...items);},replaceChildren(...items){this.children=items;},addEventListener(name,run){this.events[name]=run;},setAttribute(){},focus(){this.focused=true;},showModal(){this.open=true;},close(){this.open=false;this.events.close?.();},remove(){this.isConnected=false;}});
  const $=id=>{if(!nodes.has(id))nodes.set(id,node());return nodes.get(id);};$('list-mode').value='recent';
  const context=vm.createContext({CliConnectionsPanel:class{},$,el:node,window:{BridgeSessionLinks:{text:identity=>'codex://threads/'+identity.id}},document:{body:{append:box=>dialogs.push(box)}},SessionMenu:class{constructor(){}bind(button,context){button.menuContext=context;}},
-   BridgeClipboard:{copyWithFeedback:async(get,item)=>{if(item.disabled)return;copies.push(get());}},BridgeI18n:{locale:()=> 'en-US'},t:s=>s,localStorage:{getItem(){return null;},setItem(){}},
-   workbench:{},listIdentity:'gateway',csrf:'token',clientNavigation:{provider:'codex',clients:[]},state:null,listRows:[],currentId:null,currentHost:'local',listHasMore:false,listRenderStamp:'',listComplete:true,listReadFinished:true,availableSources:[],
+   BridgeClipboard:{copyWithFeedback:async(get,item)=>{if(item.disabled)return;copies.push(get());}},BridgeI18n:{locale:()=> 'en-US'},t:s=>s,localStorage:{getItem:key=>storage.get(key)??null,setItem:(key,value)=>storage.set(key,value)},
+   workbench:{},listIdentity:'gateway',selectedCodexEntry:null,csrf:'token',clientNavigation:{provider:'codex',clients:[]},state:null,listRows:[],currentId:null,currentHost:'local',listHasMore:false,listRenderStamp:'',listComplete:true,listReadFinished:true,availableSources:[],
    renderActivity(){},sessionAccess:v=>({canConfigure:true,canEditMessages:true,...v}),sourceLabel:()=> 'APP',dateText:()=>'',toast(){},pinRow:row=>row,sessionPins:{value:(_identity,pinned)=>!!pinned,set(identity,pinned){requests.push({url:`/${identity.host}/${identity.id}/pin`,body:{pinned}});}},desktopSessions:{refresh:async()=>{}},openChat:async()=>{},
    setTimeout:fn=>{timers.set(++timer,fn);return timer;},clearTimeout:id=>timers.delete(id),uuid:()=> 'request-id',
    api:async(url,body)=>{requests.push({url,body});return {status:'confirmed'};},sessionUrl:(id,action,host)=>`/${host}/${id}/${action}`,loadList:async()=>{}});
@@ -60,6 +60,43 @@ test('recent chat order continues to use activity when a chat is unassigned',()=
  const ui=fixture();ui.context.listRows=[ui.row('assigned',10),{...ui.row('unassigned',20),projectKey:'local|unassigned',projectName:'未归类'}];
  ui.context.renderList();
  assert.deepEqual(ui.$('sessions').children.map(row=>row.dataset.id),['unassigned','assigned']);
+});
+test('directory mode groups by server identity and shows paths without replacing native projects',()=>{
+ const ui=fixture();ui.$('list-mode').value='directory';
+ const grouped=(id,recency,key,path,missing=false)=>({...ui.row(id,recency),directoryGroup:{key,name:missing?null:'shop',path,missing}});
+ ui.context.listRows=[grouped('old',1,'local-shop','/work/shop'),grouped('other',20,'backup-shop','/backup/shop'),grouped('new',30,'local-shop','/work/shop'),grouped('missing',100,'no-cwd',null,true)];
+ const before=JSON.stringify(ui.context.listRows);ui.context.renderList();
+ const groups=ui.$('sessions').children;
+ assert.deepEqual(groups.map(group=>group.children.slice(1).map(row=>row.dataset.id)),[['new','old'],['other'],['missing']]);
+ assert.equal(groups[0].children[0].textContent,'shop · 此电脑');
+ assert.equal(groups[0].children[0].children[0].textContent,'/work/shop');
+ assert.equal(groups[1].children[0].children[0].textContent,'/backup/shop');
+ assert.equal(groups[2].children[0].textContent,'无工作目录 · 此电脑');
+ assert.equal(groups[0].children[1].children[2].children[0].textContent,'shop · 此电脑');
+ assert.equal(JSON.stringify(ui.context.listRows),before);
+ assert.equal(ui.context.sessionMenuContext(ui.context.listRows[0]).projectName,'Project');
+});
+test('directory metadata loading and unsupported rows are distinct from missing working directories',()=>{
+ const ui=fixture();ui.$('list-mode').value='directory';
+ ui.context.listRows=[{...ui.row('old-cache',2),cwd:'/recorded/path'}, {...ui.row('no-cwd',1),directoryGroup:{key:'missing',name:null,path:null,missing:true}}];
+ ui.context.listReadFinished=false;ui.context.renderList();
+ assert.equal(ui.$('sessions').children[0].textContent,'正在读取工作目录…');
+ assert.equal(ui.$('sessions').children[1].children[0].textContent,'无工作目录 · 此电脑');
+ ui.context.listReadFinished=true;ui.context.renderList();
+ assert.equal(ui.$('sessions').children[0].textContent,'部分接入暂不支持按工作目录分类，请切换显示方式。');
+ ui.context.listRows[0].directoryGroup={key:'known',name:'path',path:'/recorded/path',missing:false};ui.context.renderList();
+ assert.equal(ui.$('sessions').children[0].children[0].textContent,'path · 此电脑');
+});
+test('directory folds survive added rows and stay separate across modes, gateways and entries',()=>{
+ const ui=fixture();ui.$('list-mode').value='directory';
+ const row=id=>({...ui.row(id,1),directoryGroup:{key:'shared-key',name:'shop',path:'/work/shop',missing:false}});
+ ui.context.listRows=[row('first')];ui.context.renderList();let group=ui.$('sessions').children[0];
+ group.open=false;group.ontoggle();ui.context.listRows.push(row('next'));ui.context.renderList();
+ assert.equal(ui.$('sessions').children[0].open,false);
+ ui.$('list-mode').value='project';ui.context.renderList();assert.equal(ui.$('sessions').children[0].open,true);
+ ui.$('list-mode').value='directory';ui.context.selectedCodexEntry='codex:other';ui.context.renderList();assert.equal(ui.$('sessions').children[0].open,true);
+ ui.context.selectedCodexEntry=null;ui.context.listIdentity='other-gateway';ui.context.renderList();assert.equal(ui.$('sessions').children[0].open,true);
+ ui.context.listIdentity='gateway';ui.context.renderList();assert.equal(ui.$('sessions').children[0].open,false);
 });
 test('opaque provider IDs and archive capability stay isolated',async()=>{
  const ui=fixture(),chat={...ui.row('opaque/native-id',1),capabilities:{archive:true}};

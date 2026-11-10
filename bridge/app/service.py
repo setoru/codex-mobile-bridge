@@ -32,6 +32,7 @@ from bridge.clients.desktop_app import DesktopApp
 from bridge.clients.codex.transport import ipc_endpoint
 from bridge.features.sessions.model import apply_patches, attachment_prompt, computer_use_approval, items_array, normalize_state, normalize_request, ordered_turns, pending_requests, async_requests, request_id, user_display_text
 from bridge.features.sessions.store import SessionStore, StoreUnavailable, persisted_submission_ids
+from bridge.features.sessions.directory_grouping import directory_group
 from bridge.features.workspace.files import artifact_paths, referenced_model_images
 from bridge.features.workspace.workspace import operate as workspace_operation
 from bridge.clients.codex.catalog import Catalog, CatalogError, ModelStore, MODEL_REFRESH_SECONDS
@@ -1737,6 +1738,10 @@ class Bridge:
                 rows = ([] if source == 'wsl' else bridge.store.poll('list', options) if remote else
                         bridge.store.list(**options))
                 rows = self.hosts.decorate(rows, bridge.host, label, bridge.organization_commands.native_memberships())
+                for row in rows:
+                    target_style = row.pop('_targetPathStyle', None) if not bridge.local else os.name
+                    row['directoryGroup'] = directory_group(row.get('cwd'), scope=('codex', bridge.host),
+                                                            target_path_style=target_style)
                 with bridge.lock:
                     bridge.listed.update(row['id'] for row in rows)
                     for row in rows:

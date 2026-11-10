@@ -151,6 +151,8 @@ class RemoteStore:
         suffix = ('\nimport os\nhome_source = "environment" if os.environ.get("CODEX_HOME") else "default"\n'
                   's = SessionStore(Path(os.environ.get("CODEX_HOME", str(Path.home()/".codex"))))\n'
                   'result = s.' + method + '(**' + payload(args) + ')\n')
+        if method == 'list':
+            suffix += 'for row in result: row["_targetPathStyle"] = "windows" if os.name == "nt" else "posix"\n'
         if method == 'discovery_diagnostics':
             suffix += 'result["homeSource"] = home_source\n'
         return ssh_read(self.alias, source + suffix + 'print(json.dumps(result, ensure_ascii=False))\n', timeout=30)

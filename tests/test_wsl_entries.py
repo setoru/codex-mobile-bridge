@@ -447,6 +447,27 @@ class WslSessionTests(unittest.TestCase):
         self.entry.store.available_sources.return_value = []
         self.assertEqual(self.entry.list(source='desktop', include_sources=True), ([], []))
 
+    def test_directory_display_preserves_posix_paths_and_legacy_project_fields(self):
+        paths = ['/work/Project', '/work/project', '/work/a\\b', None]
+        self.entry.store.list = Mock(side_effect=lambda **_: [
+            {'id': str(index), 'cwd': cwd, 'source': 'cli'} for index, cwd in enumerate(paths)])
+        rows = self.entry.list(source='wsl')
+        self.assertEqual([row['directoryGroup']['name'] for row in rows], ['Project', 'project', 'a\\b', None])
+        self.assertEqual(len({row['directoryGroup']['key'] for row in rows}), 4)
+        self.assertEqual([row['cwd'] for row in rows], paths)
+        self.assertEqual(rows[0]['projectKey'], self.entry.host + '|/work/Project')
+        self.assertEqual(rows[0]['projectName'], 'Project')
+        self.assertTrue(rows[-1]['directoryGroup']['missing'])
+        self.assertEqual(self.entry.server.calls, [])
+        from bridge.app.service import Bridge
+        gateway = Bridge(Path(self.temp.name) / 'default', Path(self.temp.name) / 'gateway')
+        self.addCleanup(gateway.close)
+        with patch.object(gateway.entries, 'hosts', return_value={self.entry.host: self.row}), \
+                patch.object(gateway.entries, 'get', return_value=self.entry):
+            for merged in (gateway.list(source='wsl'), gateway.list(entry=self.entry.host, source='wsl')):
+                self.assertEqual({row['id']: row['directoryGroup'] for row in merged},
+                                 {row['id']: row['directoryGroup'] for row in rows})
+
     def test_register_project_executes_on_selected_wsl_and_persists_identity(self):
         identity = {'cwd': '/home/fixture/new-project', 'device': 1, 'inode': 42}
         with patch.object(self.entry, 'read', return_value=identity) as read:

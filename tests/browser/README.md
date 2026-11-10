@@ -52,6 +52,12 @@ Markdown 与公式检查也由此入口执行：先加载生产聊天与公式�
 断言使用当前消息节点，因为文件引用更新可能合法地替换旧 DOM 节点。
 
 
+## Codex 按工作目录分类
+
+`codex-directory-grouping.spec.cjs` 使用生产页面和合成 HTTP 路由，所有客户端写入均拒绝；活动查询只返回空合成状态。运行 `npm run test:browser -- codex-directory-grouping.spec.cjs` 可单独检查 Chromium/WebKit 的 1280 px 与 390 px 四种组合。
+
+检查覆盖三个显示模式、151 条会话跨页合并与去重、键盘折叠及刷新保留、同名不同路径和长路径可读性、缺少工作目录、搜索/来源/归档筛选、已打开聊天与未发送草稿、网关及独立 Codex 入口的偏好隔离，以及旧缓存缺少目录字段时等待新响应。它保留原生项目“未归类”的独立显示，不访问真实网关或会话。
+
 ## 新建聊天与项目目录
 
 `project-creation.browser.js` 在已加载生产 Web 脚本的隔离 loopback 页面中运行。

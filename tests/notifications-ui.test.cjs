@@ -710,3 +710,46 @@ test('a list generation keeps its captured mode for delayed remote host reads',a
   resolveLocal(ui.response({sessions:[],remoteHosts:['ssh:fixture'],availableSources:[],complete:true}));await pending;
   assert.equal(ui.listRequests.length,2);assert.ok(ui.listRequests.every(url=>new URL(url,'http://fixture').searchParams.get('order')==='recent'));
 });
+test('directory mode requests the existing non-pinned order and retains its own snapshot',async()=>{
+  const ui=await fixture({skipStartup:true});ui.nodes.get('app').hidden=false;
+  ui.run(`listIdentity='${'a'.repeat(64)}'`);ui.nodes.get('list-mode').value='directory';
+  ui.setList(()=>ui.response({sessions:[{id:'chat',host:'local',title:'Title',projectKey:'native',projectName:'Native',recency:1,directoryGroup:{key:'directory-key',name:'shop',path:'/work/shop',missing:false}}],remoteHosts:[],availableSources:['desktop'],complete:true}));
+  await ui.run('loadList(true)');
+  assert.equal(new URL(ui.listRequests.at(-1),'http://fixture').searchParams.get('order'),'project');
+  assert.equal(JSON.parse(ui.run('currentListFilter()'))[3],'directory');
+  const snapshot=JSON.parse([...ui.localStore.values()][0]);
+  assert.equal(snapshot.rows[0].directoryGroup.path,'/work/shop');
+  assert.equal(snapshot.rows[0].projectKey,'native');
+});
+test('display mode migrates a legacy choice once and remains isolated by gateway and Codex entry',async()=>{
+  const localStore=new Map([['list-mode','project']]),ui=await fixture({localStore,skipStartup:true});
+  ui.run(`listIdentity='${'a'.repeat(64)}';restoreListMode()`);
+  assert.equal(ui.nodes.get('list-mode').value,'project');
+  ui.nodes.get('list-mode').value='directory';await ui.nodes.get('list-mode').onchange();
+  ui.run("selectedCodexEntry='codex:other';restoreListMode()");
+  assert.equal(ui.nodes.get('list-mode').value,'project');
+  ui.nodes.get('list-mode').value='recent';await ui.nodes.get('list-mode').onchange();
+  ui.run('selectedCodexEntry=null;restoreListMode()');assert.equal(ui.nodes.get('list-mode').value,'directory');
+  localStore.set('list-mode','invalid');ui.run(`listIdentity='${'b'.repeat(64)}';restoreListMode()`);
+  assert.equal(ui.nodes.get('list-mode').value,'recent');
+  ui.run(`listIdentity='${'a'.repeat(64)}';selectedCodexEntry='codex:other';restoreListMode()`);
+  assert.equal(ui.nodes.get('list-mode').value,'recent');
+  assert.equal(localStore.get('list-mode'),'invalid','new preferences do not overwrite the legacy global setting');
+});
+test('directory mode rejects a cache without directory metadata while project mode can still read it',async()=>{
+  const ui=await fixture({skipStartup:true});ui.run(`listIdentity='${'a'.repeat(64)}'`);
+  const snapshot=JSON.stringify({rows:[{id:'saved',host:'local',title:'Saved',cwd:'/work/shop',projectKey:'native',projectName:'Native',recency:1}],sources:['desktop'],hosts:[],hasMore:false});
+  ui.nodes.get('list-mode').value='directory';ui.localStore.set(ui.run('listSnapshotKey(currentListFilter())'),snapshot);
+  assert.equal(ui.run('restoreListSnapshot()'),false);
+  assert.equal(ui.run('listRows.length'),0);
+  ui.nodes.get('list-mode').value='project';ui.localStore.set(ui.run('listSnapshotKey(currentListFilter())'),snapshot);
+  assert.equal(ui.run('restoreListSnapshot()'),true);
+  assert.equal(ui.run('listRows[0].projectKey'),'native');
+});
+test('an unchanged directory refresh retains existing group and chat nodes',async()=>{
+  const ui=await fixture({skipStartup:true});ui.nodes.get('list-mode').value='directory';
+  ui.setList(()=>ui.response({sessions:[{id:'chat',host:'local',title:'Title',projectKey:'native',projectName:'Native',recency:1,directoryGroup:{key:'directory-key',name:'shop',path:'/work/shop',missing:false}}],remoteHosts:[],availableSources:['desktop'],complete:true}));
+  await ui.run('loadList(true)');const group=ui.nodes.get('sessions').children[0];
+  await ui.run('loadList(true)');
+  assert.equal(ui.nodes.get('sessions').children[0],group);
+});
