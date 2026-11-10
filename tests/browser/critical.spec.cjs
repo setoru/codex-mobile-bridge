@@ -237,6 +237,8 @@ for (const [name, file, invoke] of [
   ['agent manual model and reasoning settings', 'agent-model-settings', 'runAgentModelSettingsChecks'],
   ['chat history, list entry and scroll position', 'desktop-history', 'runDesktopHistoryBrowserChecks'],
   ['shared chat reading state across refreshes', 'chat-reading-state', 'runChatReadingStateChecks'],
+  ['default Codex mixed sources and prefix pagination', 'codex-session-sources', 'runCodexSessionSourcesChecks'],
+  ['Codex deep links wait for authoritative session sources', 'codex-session-sources', 'runCodexDeepLinkChecks'],
   ['account-scoped drafts and late send acknowledgement', 'persistent-drafts', 'runPersistentDraftTests'],
   ['API form labels, layout and upstream model selection', 'api-form', 'runApiFormBrowserChecks'],
   ['CLI release single and all across local WSL SSH', 'cli-release', 'runCliReleaseChecks'],

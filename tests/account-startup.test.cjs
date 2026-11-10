@@ -15,7 +15,7 @@ async function fixture(read,kind='chatgpt',catalog=null,gatewayLanguage,accountS
   }
   const storage=()=>({getItem(){return null;},setItem(){},clear(){}});
   const response=(data,status=200)=>({ok:status===200,status,json:async()=>data});
-  const context=vm.createContext({CliConnectionsPanel:class{clear(){}},ClientNavigation:class{constructor(){this.provider="codex";this.clients=[];}async refresh(){}async openChatLink(hash){assert.equal(hash,'','This fixture enters without a chat deep link');return false;}},DesktopSessionsView:class{bindListCache(){}previewCachedList(){return false;}clear(){}},Workbench:class{open(){}reset(){}setThumbnails(){}relabel(){}},AbortController,Event:class{constructor(type){this.type=type;}},navigator:{userAgent:'test'},Date,Option:function(text,value){return {...node('option'),textContent:text,value};},document:{addEventListener(){},dispatchEvent(){},documentElement:{classList:{contains(){return false;}}},getElementById:id=>nodes.get(id),querySelector:()=>({classList:{toggle(){}}}),querySelectorAll:()=>[],createElement:node},
+  const context=vm.createContext({CliConnectionsPanel:class{clear(){}},ClientNavigation:class{constructor(){this.provider="codex";this.clients=[];}async refresh(){}async openChatLink(hash){assert.equal(hash,'','This fixture enters without a chat deep link');return false;}},DesktopSessionsView:class{bindListCache(){}previewCachedList(){return false;}clear(){}},Workbench:class{open(){}reset(){}setThumbnails(){}relabel(){}},AbortController,URLSearchParams,Event:class{constructor(type){this.type=type;}},navigator:{userAgent:'test'},Date,Option:function(text,value){return {...node('option'),textContent:text,value};},document:{addEventListener(){},dispatchEvent(){},documentElement:{classList:{contains(){return false;}}},getElementById:id=>nodes.get(id),querySelector:()=>({classList:{toggle(){}}}),querySelectorAll:()=>[],createElement:node},
     window:{addEventListener:(name,fn)=>events[name]=fn},localStorage:storage(),sessionStorage:storage(),
     location:{hash:'',pathname:'/',search:''},history:{state:null,replaceState(state){this.state=state;},pushState(state){this.state=state;},back(){}},
     setTimeout(fn,delay){timers.set(++timerId,{fn,delay});return timerId;},clearTimeout(id){timers.delete(id);},setInterval(fn,delay){intervals.push({fn,delay});},
@@ -480,6 +480,186 @@ test('opening a chat reads its timeline before starting model or skill catalogs'
  ui.run('catalogStarted=false;scheduleCatalog();chatOpenGeneration++');
  const stale=[...ui.timers.values()].filter(timer=>timer.delay===0).at(-1);await stale.fn();
  assert.equal(ui.requests.filter(url=>url.includes('/catalog?')).length,2);
+});
+
+async function chatOpeningFixture(){
+ const ui=await fixture(r=>r(official));
+ ui.nodes.get('app').classList.contains=()=>true;
+ ui.run(fs.readFileSync(path.join(__dirname,'../web/features/chat/timeline.js'),'utf8'));
+ ui.run(`
+  window.chatReads=[];window.activations=[];window.timelines=[];window.renderedMeta=[];
+  workbench.open=(id,host)=>workbench.current={id,host,active:'chat'};
+  workModes.open=()=>{};attachments.open=()=>{};scheduleCatalog=()=>{};loadNotificationState=()=>{};reportVisibleChat=()=>{};
+  renderList=()=>{};renderSourceFilter=()=>true;renderHostErrors=()=>{};refreshActivity=()=>{};
+  clientNavigation.acknowledgeList=()=>{};listSync.acknowledgeSuccess=()=>{};
+  renderState=meta=>{state=meta;window.renderedMeta.push(meta);};
+  api=(url,body,signal)=>{
+   if(body?.activate){window.activations.push({url,body,signal});return Promise.resolve({});}
+   return new Promise((resolve,reject)=>window.chatReads.push({url,signal,resolve,reject}));
+  };
+  const NativeTimeline=ChatTimeline;
+  ChatTimeline=class{
+   constructor(options){
+    const timeline=Object.assign(Object.create(NativeTimeline.prototype),options,{
+     abort:new AbortController(),cached:false,sequence:-1,generation:0,following:true,
+     rows:new Map(),nodes:new Map(),files:new Map(),details:new Map(),
+     container:document.getElementById('messages'),older:document.getElementById('older'),
+     newer:document.getElementById('newer'),capture(){return null;},restore(){},
+     refreshActions(){},historyStatus(){},updates(){},dispose(){this.abort.abort();}
+    });
+    window.timelines.push(timeline);return timeline;
+   }
+  };
+ `);
+ return Object.assign(ui,{
+  open:(id='target',host='local')=>ui.run(`openChat(${JSON.stringify(id)},${JSON.stringify(host)})`),
+  reads:()=>ui.run('window.chatReads'),activations:()=>ui.run('window.activations'),
+  timelines:()=>ui.run('window.timelines'),
+  async list(rows){
+   const loading=ui.run('loadList(true)'),request=ui.run('window.chatReads.shift()');
+   assert.match(request.url,/^\/api\/sessions\?scope=host/);
+   request.resolve({sessions:rows,availableSources:['desktop'],remoteHosts:[],complete:true});
+   await loading;
+  },
+  page:(source,id='target',host='local')=>({epoch:'fixture',sequence:1,rows:[],files:[],before:null,hasMore:false,
+   meta:{id,host,access:{source,canReconnect:true},loadingHistory:false}})
+ });
+}
+
+test('IDE and CLI deep links without a loaded list row read history without activation',async()=>{
+ for(const source of ['ide','cli']){
+  const ui=await chatOpeningFixture(),opening=ui.open();
+  assert.equal(ui.reads().length,1);
+  assert.equal(ui.activations().length,0,'an unknown source must not inherit APP activation');
+  ui.reads().shift().resolve(ui.page(source));await opening;
+  assert.equal(ui.activations().length,0);
+  assert.equal(ui.run('window.renderedMeta.at(-1).access.source'),source);
+ }
+});
+
+test('APP deep links wait for fresh matching metadata and activate only once',async()=>{
+ const ui=await chatOpeningFixture(),opening=ui.open();
+ assert.equal(ui.activations().length,0);
+ ui.reads().shift().resolve(ui.page('desktop'));await opening;
+ assert.equal(ui.activations().length,1);
+ assert.match(ui.activations()[0].url,/\/target\/reconnect\?host=local/);
+ ui.timelines()[0].apply({...ui.page('desktop'),sequence:2});
+ assert.equal(ui.activations().length,1);
+});
+
+test('a known APP row still activates while history is pending',async()=>{
+ const ui=await chatOpeningFixture();
+ await ui.list([{id:'target',host:'local',recency:1,access:{source:'desktop',canReconnect:true}}]);
+ const opening=ui.open();
+ assert.equal(ui.reads().length,1);assert.equal(ui.activations().length,1);
+ ui.reads().shift().resolve(ui.page('desktop'));await opening;
+ assert.equal(ui.activations().length,1);
+});
+
+test('matching metadata needs an explicit APP source and permitted reconnect before activation',async()=>{
+ for(const access of [undefined,{}, {source:'unknown',canReconnect:true},{source:'desktop',canReconnect:false}]){
+  const ui=await chatOpeningFixture(),opening=ui.open(),page=ui.page('desktop');
+  page.meta.access=access;ui.reads().shift().resolve(page);await opening;
+  assert.equal(ui.activations().length,0,JSON.stringify(access));
+ }
+});
+
+test('cached APP metadata cannot activate an unknown deep link before the fresh IDE read',async()=>{
+ const ui=await chatOpeningFixture();
+ ui.run(`listIdentity='gateway';recentTimelinePages.set(JSON.stringify(['gateway','local','target']),{
+  epoch:'cached',sequence:1,rows:[],files:[],hasMore:false,
+  meta:{id:'target',host:'local',access:{source:'desktop',canReconnect:true}}
+ });`);
+ const opening=ui.open();
+ assert.equal(ui.timelines()[0].cached,true);
+ assert.equal(ui.run('window.renderedMeta.length'),0);
+ assert.equal(ui.activations().length,0);
+ ui.reads().shift().resolve(ui.page('ide'));await opening;
+ assert.equal(ui.activations().length,0);
+});
+
+test('a restored APP list snapshot waits for fresh metadata before opening an IDE conversation',async()=>{
+ const ui=await chatOpeningFixture();
+ ui.run(`listIdentity='gateway';listComplete=true;
+  localStorage.getItem=()=>JSON.stringify({
+   rows:[{id:'target',host:'local',access:{source:'desktop',canReconnect:true}}],
+   sources:['desktop'],hosts:[],hasMore:false
+  });
+  renderList=()=>{};renderSourceFilter=()=>true;restoreListSnapshot();
+ `);
+ assert.equal(ui.run('listComplete'),false);
+ const opening=ui.open();assert.equal(ui.activations().length,0);
+ ui.reads().shift().resolve(ui.page('ide'));await opening;
+ assert.equal(ui.activations().length,0);
+});
+
+test('a cached pending pin retained by a successful list read still waits for fresh conversation metadata',async()=>{
+ const ui=await chatOpeningFixture();
+ ui.nodes.get('list-mode').value='recent';
+ ui.run(`listIdentity='gateway';
+  localStorage.getItem=()=>JSON.stringify({
+   rows:[{id:'target',host:'local',recency:1,bridgePinned:true,access:{source:'desktop',canReconnect:true}}],
+   sources:['desktop'],hosts:[],hasMore:false
+  });
+  restoreListSnapshot();sessionPins.pending=identity=>identity.id==='target';
+ `);
+ await ui.list([]);
+ assert.equal(ui.run('listComplete'),true);
+ assert.equal(ui.run('listRows.length'),1,'the pending pin must remain visible');
+ assert.equal(ui.run('listRows[0].access.source'),'desktop');
+ const opening=ui.open();assert.equal(ui.activations().length,0,'retained cached APP access is not fresh list evidence');
+ ui.reads().shift().resolve(ui.page('ide'));await opening;
+ assert.equal(ui.activations().length,0);
+});
+
+test('an automatic APP activation failure is not replayed by later metadata',async()=>{
+ const ui=await chatOpeningFixture();
+ ui.run(`const originalApi=api;toast=()=>{};api=(url,body,signal)=>{
+  if(body?.activate){window.activations.push({url,body,signal});return Promise.reject(Error('activation result unknown'));}
+  return originalApi(url,body,signal);
+ };`);
+ const opening=ui.open();ui.reads().shift().resolve(ui.page('desktop'));await opening;
+ ui.timelines()[0].apply({...ui.page('desktop'),sequence:2});
+ assert.equal(ui.activations().length,1);
+});
+
+test('APP metadata can activate after the first timeline read fails and retries',async()=>{
+ const ui=await chatOpeningFixture(),opening=ui.open();
+ ui.reads().shift().reject(Error('fixture read failed'));await opening;
+ assert.equal(ui.activations().length,0);
+ const retry=[...ui.timers.values()].find(timer=>timer.delay===3000);assert.ok(retry);
+ const retried=retry.fn();ui.reads().shift().resolve(ui.page('desktop'));await retried;
+ assert.equal(ui.activations().length,1);
+});
+
+test('late metadata from a previous chat or another host cannot activate a new opening',async()=>{
+ const ui=await chatOpeningFixture(),first=ui.open('target','local');
+ const old=ui.timelines()[0],firstRead=ui.reads().shift();
+ const second=ui.open('target','ssh-fixture'),secondRead=ui.reads().shift();
+ firstRead.resolve(ui.page('desktop'));await first;
+ old.renderMeta(ui.page('desktop').meta);
+ assert.equal(ui.activations().length,0);
+ ui.timelines()[1].renderMeta(ui.page('desktop','target','local').meta);
+ ui.timelines()[1].renderMeta(ui.page('desktop','other','ssh-fixture').meta);
+ assert.equal(ui.activations().length,0);
+ secondRead.resolve(ui.page('ide','target','ssh-fixture'));await second;
+ assert.equal(ui.activations().length,0);
+});
+
+test('aborted or replaced timelines and closed chat views cannot activate from late metadata',async()=>{
+ for(const change of ['chatTimeline.abort.abort()','chatOpenGeneration++','chatTimeline=null',
+                      'currentId="other"','currentHost="other"','workbench.current={id:"target",host:"local"}']){
+  const ui=await chatOpeningFixture(),opening=ui.open(),timeline=ui.timelines()[0];
+  ui.run(change);timeline.renderMeta(ui.page('desktop').meta);
+  assert.equal(ui.activations().length,0,change);
+  ui.reads().shift().resolve(ui.page('ide'));await opening;
+ }
+ const ui=await chatOpeningFixture(),opening=ui.open();
+ ui.nodes.get('app').classList.contains=()=>false;
+ ui.timelines()[0].renderMeta(ui.page('desktop').meta);
+ assert.equal(ui.activations().length,0);
+ assert.equal(ui.run('window.renderedMeta.at(-1).access.source'),'desktop','hidden current chats still receive fresh display state');
+ ui.reads().shift().resolve(ui.page('ide'));await opening;
 });
 
 test('deferred startup refresh is discarded after leaving the authenticated page',async()=>{

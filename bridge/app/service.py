@@ -1728,7 +1728,7 @@ class Bridge:
                 remote = self.host == 'local' and isinstance(bridge.store, RemoteStore)
                 available = ((bridge.store.poll('available_sources', {}) if remote else
                               bridge.store.available_sources()) if include_sources else [])
-                excluded = () if bridge.host.startswith('codex:') else ('ide',)
+                excluded = () if bridge.local else ('ide',)
                 available = [item for item in available if item not in excluded]
                 pins = set(bridge.session_pins.identifiers())
                 options = dict(limit=limit + offset, archived=archived, query=query, source=source,

@@ -6,7 +6,7 @@ import tempfile
 import unittest
 import uuid
 from pathlib import Path
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 
 from bridge.app.service import Bridge
 from bridge.clients.codex.ipc import IPCError
@@ -88,6 +88,189 @@ class RuntimeEnvironmentTests(unittest.TestCase):
                         check()
                 finally:
                     bridge.close()
+
+
+class DefaultIdeTests(CliBridgeFixture):
+    def setUp(self):
+        super().setUp()
+        with closing(sqlite3.connect(self.home / 'state_5.sqlite')) as db, db:
+            db.execute("UPDATE threads SET title='Saved IDE', source='vscode', originator='codex_vscode'")
+        absent = IPCError('desktop absent')
+        absent.__cause__ = FileNotFoundError()
+        self.bridge.ipc.connect.side_effect = absent
+
+    def test_mixed_inventory_filters_and_paginates_without_activating(self):
+        expected = {'ide': {self.thread_id}, 'desktop': set(), 'cli': {'cli'}}
+        with closing(sqlite3.connect(self.home / 'state_5.sqlite')) as db, db:
+            for origin, originator, start in [('desktop', 'Codex Desktop', 200), ('ide', 'codex_vscode', 5)]:
+                rows = [(f'{origin}-{i:03}', origin, '/fixture', start + i // 2, 0, originator, 'vscode')
+                        for i in range(120)]
+                db.executemany('INSERT INTO threads(id,title,cwd,updated_at,archived,originator,source) VALUES(?,?,?,?,?,?,?)', rows)
+                expected[origin].update(row[0] for row in rows)
+            db.execute("INSERT INTO threads(id,title,cwd,updated_at,archived,originator,source) "
+                       "VALUES('cli','CLI','/fixture',2,0,'codex_cli_rs','cli')")
+            db.execute("INSERT INTO threads(id,title,cwd,updated_at,archived,originator,source) "
+                       "VALUES('archived-ide','Saved IDE','/fixture',999,1,'codex_vscode','vscode')")
+        expected['all'] = set.union(*expected.values())
+        with patch('subprocess.Popen', side_effect=AssertionError('List launched a process')):
+            for local_only in (False, True):
+                for source, identifiers in expected.items():
+                    with self.subTest(local_only=local_only, source=source):
+                        rows, available = self.bridge.list(source=source, limit=1000,
+                                                           local_only=local_only, include_sources=True)
+                        self.assertEqual({row['id'] for row in rows}, identifiers)
+                        self.assertEqual(available, ['cli', 'desktop', 'ide'])
+                        if source != 'all':
+                            self.assertTrue(all(row['access']['source'] == source for row in rows))
+            self.bridge.session_pins.set(self.thread_id, True)
+            for pin_order in (False, True):
+                with self.subTest(pin_order=pin_order):
+                    full = self.bridge.list(limit=1000, pin_order=pin_order)
+                    identifiers = [row['id'] for row in full]
+                    self.assertEqual(len(identifiers), 242)
+                    pages = [row['id'] for offset in (0, 100, 200)
+                             for row in self.bridge.list(offset=offset, pin_order=pin_order)]
+                    self.assertEqual(pages, identifiers)
+                    self.assertEqual(len(set(pages)), len(pages))
+                    for limit in (100, 200, 300):
+                        prefix = self.bridge.list(limit=limit, pin_order=pin_order)
+                        self.assertEqual([row['id'] for row in prefix], identifiers[:limit])
+                    self.assertEqual(identifiers[0] == self.thread_id, pin_order)
+            self.assertEqual([row['id'] for row in self.bridge.list(query='Saved IDE')], [self.thread_id])
+            self.assertEqual([row['id'] for row in self.bridge.list(archived=True, source='ide')], ['archived-ide'])
+            self.assertEqual(self.bridge.list(query='not found', include_sources=True), ([], ['cli', 'desktop', 'ide']))
+        self.cli.attach.assert_not_called()
+        self.cli.call.assert_not_called()
+        self.bridge.ipc.connect.assert_not_called()
+
+    def test_visible_ide_parent_groups_attachments_but_preserves_roots(self):
+        with closing(sqlite3.connect(self.home / 'state_5.sqlite')) as db, db:
+            db.execute('ALTER TABLE threads ADD COLUMN attached_thread_parent_id TEXT')
+            db.execute('ALTER TABLE threads ADD COLUMN forked_from_id TEXT')
+            db.execute('ALTER TABLE threads ADD COLUMN thread_source TEXT')
+            db.executemany('INSERT INTO threads(id,title,cwd,updated_at,archived,originator,source,'
+                           'attached_thread_parent_id,forked_from_id,thread_source) VALUES(?,?,?,?,?,?,?,?,?,?)', [
+                ('attached-app', 'Side', '/fixture', 10, 0, 'Codex Desktop', 'vscode', self.thread_id, None, None),
+                ('attached-ide', 'Side', '/fixture', 9, 0, 'codex_vscode', 'vscode', self.thread_id, None, None),
+                ('orphan-ide', 'Orphan', '/fixture', 8, 0, 'codex_vscode', 'vscode', 'missing', None, None),
+                ('fork-ide', 'Fork', '/fixture', 7, 0, 'codex_vscode', 'vscode', None, self.thread_id, None),
+                ('subagent', 'Worker', '/fixture', 6, 0, 'codex_vscode', 'vscode', None, None, 'subagent'),
+                ('old-subagent', 'Worker', '/fixture', 5, 0, 'codex_vscode', '{"subagent":{}}', None, None, None),
+            ])
+        rows = self.bridge.list()
+        self.assertEqual({row['id'] for row in rows}, {self.thread_id, 'orphan-ide', 'fork-ide'})
+        self.assertTrue(next(row for row in rows if row['id'] == 'orphan-ide')['orphanedSideChat'])
+        self.assertEqual({row['id'] for row in self.bridge.store.attached_children(self.thread_id)},
+                         {'attached-app', 'attached-ide'})
+
+    def test_independent_home_keeps_its_own_inventory_even_with_shared_ids(self):
+        other = self.home / 'other-home'
+        other.mkdir()
+        (other / 'config.toml').write_text('model="fixture"\n')
+        with closing(sqlite3.connect(other / 'state_5.sqlite')) as db, db:
+            db.execute('CREATE TABLE threads(id TEXT,title TEXT,cwd TEXT,updated_at INT,archived INT,originator TEXT,source TEXT)')
+            db.executemany('INSERT INTO threads VALUES(?,?,?,?,?,?,?)', [
+                (self.thread_id, 'Other IDE', '/other/project', 2, 0, 'codex_vscode', 'vscode'),
+                ('other-only', 'Other CLI', '/other/project', 1, 0, 'codex_cli_rs', 'cli'),
+            ])
+        entry = self.bridge.entries.save_local(str(other), 'Other')['entry']
+        target = self.bridge.for_host(entry)
+        with patch('subprocess.Popen', side_effect=AssertionError('List launched a process')), \
+                patch.object(target.store, 'list', wraps=target.store.list) as other_read:
+            rows = self.bridge.list()
+            self.assertEqual([(row['id'], row['host'], row['cwd']) for row in rows],
+                             [(self.thread_id, 'local', self.native_state['cwd'])])
+            other_read.assert_not_called()
+            with patch.object(self.bridge.store, 'list', side_effect=AssertionError('Read default home')):
+                rows, available = self.bridge.list(entry=entry, include_sources=True)
+            self.assertEqual({row['id'] for row in rows}, {self.thread_id, 'other-only'})
+            self.assertEqual(available, ['cli', 'ide'])
+            self.assertTrue(all(row['host'] == entry and row['cwd'] == '/other/project' for row in rows))
+
+    def test_ssh_keeps_ide_excluded_in_host_and_aggregate_reads(self):
+        with closing(sqlite3.connect(self.home / 'state_5.sqlite')) as db, db:
+            db.execute("INSERT INTO threads(id,title,cwd,updated_at,archived,originator,source) "
+                       "VALUES('cli','CLI','/fixture',2,0,'codex_cli_rs','cli')")
+        self.bridge.hosts.hosts = Mock(return_value={'ssh-fixture': {'alias': 'fixture'}})
+        remote = self.bridge.for_host('ssh-fixture')
+        # Execute the remote query against a synthetic database, without SSH.
+        store = self.bridge.store
+        with patch.object(remote.store, 'list', wraps=store.list), \
+                patch.object(remote.store, 'available_sources', wraps=store.available_sources), \
+                patch.object(remote.store, 'poll', side_effect=lambda method, args: getattr(store, method)(**args)):
+            rows, available = remote.list(include_sources=True)
+            self.assertEqual([row['id'] for row in rows], ['cli'])
+            self.assertEqual(available, ['cli'])
+            self.assertEqual(remote.list(source='ide'), [])
+            rows, available = self.bridge.list(include_sources=True)
+            self.assertEqual({(row['host'], row['id']) for row in rows},
+                             {('local', self.thread_id), ('local', 'cli'), ('ssh-fixture', 'cli')})
+            self.assertEqual(available, ['cli', 'ide'])
+
+    def test_passive_history_preserves_identity_without_resuming(self):
+        with patch('bridge.app.service.open_in_desktop') as navigation:
+            self.bridge.list()
+            self.bridge.view(self.thread_id, background=True)
+            self.wait_for_background_read()
+            view = self.bridge.view(self.thread_id, attach=False)
+        self.assertFalse(view['connected'])
+        self.assertEqual(view['access']['source'], 'ide')
+        self.assertFalse(view['access']['canSend'])
+        self.assertIn(self.private_text, str(view))
+        self.assertEqual(view['provider'], self.native_state['modelProvider'])
+        self.assertEqual(view['cwd'], self.native_state['cwd'])
+        self.cli.attach.assert_not_called()
+        self.cli.call.assert_not_called()
+        navigation.assert_not_called()
+
+    def test_absent_editor_requires_explicit_continue_with_original_identity(self):
+        with self.assertRaisesRegex(IPCError, '主动继续'):
+            self.bridge._target(self.thread_id)
+        self.cli.attach.assert_not_called()
+        self.bridge.reconnect_session(self.thread_id)
+        session = self.bridge.session(self.thread_id, attach=False)
+        self.assertTrue(session.connected)
+        self.assertEqual(session.origin, 'ide')
+        self.assertEqual(session.state['cwd'], self.native_state['cwd'])
+        self.assertEqual(session.state['modelProvider'], self.native_state['modelProvider'])
+        self.cli.attach.assert_called_once_with(self.thread_id, explicit=True)
+
+    def test_existing_editor_owner_requires_original_identity_and_receives_sends(self):
+        from tests.test_cli_bridge_integration import CliBridgeTests
+        self.cli.available.return_value = False
+        with patch('bridge.app.service.open_in_desktop') as navigation:
+            for mismatch in ({'cwd': '/other/project'}, {'modelProvider': 'other'}, {'hostId': 'other'}, {}):
+                with self.subTest(mismatch=mismatch):
+                    self.bridge.live.pop(self.thread_id, None)
+                    CliBridgeTests.desktop_owner(self, {**self.native_state, **mismatch})
+                    session = self.bridge.session(self.thread_id)
+                    self.bridge.ipc.owner.assert_called_once_with(self.thread_id, host='local')
+                    self.bridge.ipc.follow.assert_called_once_with(self.thread_id, 'desktop-owner', host='local')
+                    self.assertEqual(session.connected, not mismatch)
+                    self.assertEqual(session.origin, 'ide')
+                    self.assertEqual(session.access['canSend'], not mismatch)
+            self.assertEqual(session.owner, 'desktop-owner')
+            self.assertEqual(session.runtime, 'desktop')
+            self.assertEqual(session.state['cwd'], self.native_state['cwd'])
+            self.assertEqual(session.state['modelProvider'], self.native_state['modelProvider'])
+            self.bridge.ipc.request = Mock(return_value={'result': {'ok': True}})
+            self.bridge.send(self.thread_id, 'fixture message', str(uuid.uuid4()))
+            self.assertEqual(self.bridge.ipc.request.call_args.args[0], 'thread-follower-start-turn')
+            self.assertEqual(self.bridge.ipc.request.call_args.kwargs['target'], 'desktop-owner')
+            self.assertEqual(self.bridge.ipc.request.call_args.kwargs['host'], 'local')
+        self.cli.attach.assert_not_called()
+        self.cli.call.assert_not_called()
+        navigation.assert_not_called()
+
+    def test_unconfirmed_editor_owner_never_starts_another_writer(self):
+        self.bridge.ipc.connect = Mock()
+        for error in ('桌面读取超时；尚未取得实时会话状态。', '现有 Codex App 连接与此会话不匹配，未连接'):
+            with self.subTest(error=error):
+                self.bridge.live.clear()
+                self.bridge.ipc.owner.side_effect = IPCError(error)
+                with self.assertRaises(IPCError):
+                    self.bridge.reconnect_session(self.thread_id)
+                self.cli.attach.assert_not_called()
 
 
 class IdeProfileTests(CliBridgeFixture):

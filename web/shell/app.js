@@ -12,6 +12,7 @@ let csrf='', currentId=null, state=null, listOffset=0, listQuery='', approvalSta
 let claudeCliAccessPanel=null;
 let currentHost='local', listRows=[], listGeneration=0, listHasMore=false, listArchived=false, listSource='all', availableSources=[], listRenderStamp='';
 let listComplete=false, listReadFinished=false, listIdentity='', listFilterKey='';
+const serverListRows=new WeakSet();
 const composerDrafts=typeof ComposerDrafts==='function'?new ComposerDrafts():null;
 let codexQuotes=null;
 let draftGateway='',codexDraftScope=null,codexDraftTouched=false,restoringComposer=false,codexActiveAccountId;const codexProvisionalDrafts=new Map();
@@ -484,7 +485,7 @@ async function loadList(reset=false){
       }
       if(result.complete===false||result.unavailableHosts?.length)errors.push(...(result.unavailableHosts||[{host,label:host,error:t('暂不可用')}]));
       else{
-        for(const row of result.sessions){const key=chatKey(row.id,row.host);row.recency=Math.max(row.recency,recentInteractions.get(key)||0);}
+        for(const row of result.sessions){serverListRows.add(row);const key=chatKey(row.id,row.host);row.recency=Math.max(row.recency,recentInteractions.get(key)||0);}
         for(const row of result.sessions)sessionPins.observe({provider:'codex',host:row.host,id:row.id},row.bridgePinned,pinRead);
         const retained=mode==='recent'?(groups.get(host)||[]).filter(row=>sessionPins.pending({provider:'codex',host:row.host,id:row.id})&&pinRow(row).bridgePinned&&!result.sessions.some(fresh=>fresh.id===row.id)):[];
         groups.set(host,[...result.sessions,...retained]);freshSources.set(host,result.availableSources||[]);
@@ -895,12 +896,30 @@ async function openChat(id,host="local"){
   const openGeneration=++chatOpenGeneration;messageActions.dialog.close();workbench.open(id,host);saveDraft();chatTimeline?.dispose();codexQuotes?.reset();currentId=id;currentHost=host;refreshEntryAccounts();codexDraftScope=null;codexDraftTouched=false;state=null;catalogStarted=false;workbench.current.access=sessionAccess(listRows.find(row=>row.id===id&&row.host===host)?.access);contextUsageControl.update(null);workModes.open(chatKey(id,host));$('send-mode').value='send';attachments.open(chatKey(id,host));modelCatalogGeneration++;catalogData={models:null,skills:null};catalogResults={models:null,skills:null};catalogTasks={models:null,skills:null};skillIndex=new Map();skillTotal=0;skillPages=[];skillQuery={q:'',offset:0,limit:200};invalidSkills=new Set();skillRequest++;modelRequest++;modelTarget=null;fastModeControl.reset();$('model-dialog').close();notificationState={available:false,watching:false,notifyOnCompletion:false};notificationRequest++;$('notify-dialog').close();$('notify-button').disabled=true;$('notify-button').textContent=t('提醒');try{selectedSkills=new Set(JSON.parse(!draftGateway?sessionStorage.getItem('skills:'+chatKey(id,host))||'[]':'[]'));}catch{selectedSkills=new Set();}renderSkillPills();approvalStamp='';submittedRequestIds.clear();$('messages').replaceChildren();$('approvals').replaceChildren();$('queued').replaceChildren();$('message').value=!draftGateway?sessionStorage.getItem('draft:'+chatKey(id,host))||'':'';$('send-error').textContent='';$('chat-title').textContent=t('正在连接…');$('status').textContent=t('连接中');$('welcome').hidden=true;$('chat').hidden=false;$('app').classList.add('chat-open');$('send').disabled=true;if(!browserNavigation.sync({provider:'codex',id,host}))history.replaceState(null,'','#'+id+'~'+encodeURIComponent(host));document.querySelectorAll('.session').forEach(n=>n.classList.toggle('selected',n.dataset.id===id&&n.dataset.host===host));const opening=workbench.current;
 try{if(window.BridgeFeatures)await window.BridgeFeatures.load('chat');}catch(error){if(openGeneration===chatOpenGeneration&&workbench.current===opening&&$('app').classList.contains('chat-open')){$('status').textContent=t('连接失败');$('send-error').textContent=t(error.message);}return;}
 if(openGeneration!==chatOpenGeneration||workbench.current!==opening||currentId!==id||currentHost!==host||!$('app').classList.contains('chat-open'))return;
-const timeline=chatTimeline=new ChatTimeline({cacheKey:listIdentity?JSON.stringify([listIdentity,host,id]):'',url:action=>sessionUrl(id,action,host),request:api,renderMeta:renderState,onReady:reportVisibleChat,onFile:async path=>{const session=workbench.current;if(currentId!==id||currentHost!==host||!session||session.id!==id||session.host!==host)return;try{const relative=timelineFilePath(path,state?.cwd);await workbench.request(workbench.url(session,'info',relative));if(workbench.current!==session||currentId!==id||currentHost!==host)return;await workbench.locate(session,relative);}catch(error){if(workbench.current===session)toast(t(error.message));}},canEdit:()=>currentAccess().canEditMessages,renderText:(node,text,files,fullText)=>renderMarkdown(node,text,files,file=>sessionUrl(id,'files/'+file.id,host),{fullText}),onAction:(action,row,timeline)=>{if(!currentAccess().canEditMessages)return;const pendingKey='fork-edit:'+host+'|'+id;let pending;try{pending=JSON.parse(sessionStorage.getItem(pendingKey));}catch{}if(pending&&pending.sourceTurnId===row.turnId&&action==='edit'){sessionStorage.setItem('message-edit:'+timeline.url('message-action')+':'+row.key,pending.text);sessionStorage.removeItem(pendingKey);}return messageActions.open(action,row,timeline);},status:text=>{$('status').textContent=t(text);}});
+let activationRequested=false;
+const isCurrent=()=>openGeneration===chatOpenGeneration&&workbench.current===opening&&currentId===id&&currentHost===host&&chatTimeline===timeline&&!timeline.abort.signal.aborted;
+const isOpening=()=>isCurrent()&&$('app').classList.contains('chat-open');
+const activateDesktop=access=>{
+  if(activationRequested||!isOpening()||!access)return;
+  const openingAccess=sessionAccess(access);
+  if(openingAccess.source==='desktop'&&openingAccess.canReconnect){
+    activationRequested=true;
+    api(sessionUrl(id,'reconnect',host),{activate:true},timeline.abort.signal).catch(error=>{if(isOpening())toast(error.message);});
+  }
+};
+const timeline=chatTimeline=new ChatTimeline({cacheKey:listIdentity?JSON.stringify([listIdentity,host,id]):'',url:action=>sessionUrl(id,action,host),request:api,renderMeta:meta=>{
+  if(!isCurrent()||meta.id!==id||meta.host!==host)return;
+  renderState(meta);
+  // Timeline only renders fresh server metadata; cached history never activates.
+  activateDesktop(meta.access);
+},onReady:reportVisibleChat,onFile:async path=>{const session=workbench.current;if(currentId!==id||currentHost!==host||!session||session.id!==id||session.host!==host)return;try{const relative=timelineFilePath(path,state?.cwd);await workbench.request(workbench.url(session,'info',relative));if(workbench.current!==session||currentId!==id||currentHost!==host)return;await workbench.locate(session,relative);}catch(error){if(workbench.current===session)toast(t(error.message));}},canEdit:()=>currentAccess().canEditMessages,renderText:(node,text,files,fullText)=>renderMarkdown(node,text,files,file=>sessionUrl(id,'files/'+file.id,host),{fullText}),onAction:(action,row,timeline)=>{if(!currentAccess().canEditMessages)return;const pendingKey='fork-edit:'+host+'|'+id;let pending;try{pending=JSON.parse(sessionStorage.getItem(pendingKey));}catch{}if(pending&&pending.sourceTurnId===row.turnId&&action==='edit'){sessionStorage.setItem('message-edit:'+timeline.url('message-action')+':'+row.key,pending.text);sessionStorage.removeItem(pendingKey);}return messageActions.open(action,row,timeline);},status:text=>{$('status').textContent=t(text);}});
   reconnectFailure=null;
   window.BridgePresentation?.openChat();
   const reading=timeline.start();
-  const openingAccess=sessionAccess(listRows.find(row=>row.id===id&&row.host===host)?.access);
-  if(openingAccess.source==='desktop'&&openingAccess.canReconnect)api(sessionUrl(id,'reconnect',host),{activate:true},timeline.abort.signal).catch(error=>{if(!timeline.abort.signal.aborted)toast(error.message);});
+  // Cached rows can survive a successful refresh while a pin is pending. Only
+  // actual server rows may activate early; other openings wait for fresh meta.
+  const openingRow=listRows.find(row=>row.id===id&&row.host===host);
+  if(serverListRows.has(openingRow))activateDesktop(openingRow.access);
   await reading;
   if(!timeline.abort.signal.aborted){scheduleCatalog();loadNotificationState(id,host);}
 }

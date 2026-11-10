@@ -224,7 +224,7 @@ class IntegrationTests(unittest.TestCase):
         def unavailable(**kwargs):
             raise StoreUnavailable('Database temporarily unavailable')
         self.bridge.store.list = unavailable
-        remote = SimpleNamespace(host='remote:test', lock=threading.RLock(), live={}, listed=set(), origins={}, _access=self.bridge._access,
+        remote = SimpleNamespace(host='remote:test', local=False, lock=threading.RLock(), live={}, listed=set(), origins={}, _access=self.bridge._access,
                                  session_pins=SimpleNamespace(identifiers=lambda: ()),
                                  organization_commands=SimpleNamespace(native_memberships=lambda: set()),
                                  store=SimpleNamespace(list=lambda **kw: [{'id': THREAD, 'title': 'Remote chat', 'cwd': '/remote', 'updated_at': 1}]))
@@ -937,6 +937,7 @@ class IntegrationTests(unittest.TestCase):
         from unittest.mock import Mock
         remote = Mock()
         remote.host = 'remote'
+        remote.local = False
         remote.lock = threading.RLock()
         remote.live = {}
         remote.origins = {}

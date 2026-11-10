@@ -18,17 +18,19 @@ App 执行的本地聊天，其 Goal 元数据通过受限的官方运行时连�
 
 ## 会话发现
 
-Windows 可在应用管理的 Codex 组内显式扫描并启用 WSL 接入，详见 [WSL 说明](docs/wsl-codex.md)。默认 Codex 列表按全部 / CLI / APP / WSL 分类；独立 Codex 配置以独立接入 ID 展示，账号、项目和会话按配置隔离。共享管理页面和导航契约见[客户端外壳](.agents/notes/implemented/architecture/2026-11-02-shared-client-shell.md)。WSL 保留 `source=cli / runtime=wsl`，不将展示分类作为执行能力。原生 APP / CLI 与各 WSL 子项分别启停，顶层状态聚合；只有 WSL 可用时也可列出环境。应用 ID 沿用 `wsl:<摘要>` 作为内部路由和缓存身份，原 IPC owner、账号、cwd、连接世代及操作回执继续隔离。列表与历史读取不恢复线程。WSL 账号由原工具或 Magpie 管理，不回退到 Windows 账号；HTTP 沿用登录、Origin、CSRF 和文件边界。WSL 停用与写入共用门锁，旧请求在停用后不能继续写文件或创建聊天，关闭接入不退出原 CLI。
+Windows 可在应用管理的 Codex 组内显式扫描并启用 WSL 接入，详见 [WSL 说明](docs/wsl-codex.md)。默认 Codex 列表按全部 / CLI / VS Code / APP / WSL 分类；默认与独立本机入口均列出各自 `CODEX_HOME` 中的 APP、CLI 和 IDE 会话，普通 SSH 列表仍排除 IDE。独立 Codex 配置以独立接入 ID 展示，账号、项目和会话按配置隔离。共享管理页面和导航契约见[客户端外壳](.agents/notes/implemented/architecture/2026-11-02-shared-client-shell.md)。WSL 保留 `source=cli / runtime=wsl`，不将展示分类作为执行能力。原生 APP / CLI 与各 WSL 子项分别启停，顶层状态聚合；只有 WSL 可用时也可列出环境。应用 ID 沿用 `wsl:<摘要>` 作为内部路由和缓存身份，原 IPC owner、账号、cwd、连接世代及操作回执继续隔离。列表与历史读取不恢复线程。WSL 账号由原工具或 Magpie 管理，不回退到 Windows 账号；HTTP 沿用登录、Origin、CSRF 和文件边界。WSL 停用与写入共用门锁，旧请求在停用后不能继续写文件或创建聊天，关闭接入不退出原 CLI。
 
-本地通过只读 SQLite 连接读取 `$CODEX_HOME/state_*.sqlite`，筛选桌面聊天并排除子代理。尚无 IPC 快照时，可读取原始会话记录作为历史展示。WAL 模式且 `-wal` 缺失时，先复制到私有临时目录，并核对复制前后主文件的身份、大小和修改时间以及 WAL 仍不存在，再读取副本；并发变化时丢弃副本并等待重试。已有 WAL 时直接只读查询，保留最新提交。发现与历史读取不直接写入原数据库或会话文件；用户新建聊天时由官方运行时持久化新记录。
+本地通过只读 SQLite 连接读取 `$CODEX_HOME/state_*.sqlite`，筛选用户会话并排除子代理。原生附属聊天归入同一配置中可访问的父会话，普通分支及父会话缺失的附属聊天仍可单独展示。尚无 IPC 快照时，可读取原始会话记录作为历史展示。WAL 模式且 `-wal` 缺失时，先复制到私有临时目录，并核对复制前后主文件的身份、大小和修改时间以及 WAL 仍不存在，再读取副本；并发变化时丢弃副本并等待重试。已有 WAL 时直接只读查询，保留最新提交。发现与历史读取不直接写入原数据库或会话文件；用户新建聊天时由官方运行时持久化新记录。
 
 发现兼容 `Codex Desktop`、`codex_work_desktop`、网关创建来源 `codex_mobile_bridge`，以及 `originator` 为空且 `source=vscode` 的旧桌面记录。列表与单会话读取使用同样的来源和子代理限制。
 
 HTTP 阅读请求先返回，保存历史和实时连接在后台加载，通过原有 SSE/长轮询更新页面。每条会话只发起一个后台连接任务，失败后间隔重试，手动重新连接可跳过重试间隔。SSH/SQLite 元数据读取不占用会话总锁；写操作仍须确认原生 owner 已连接。只读超时与写入结果未知使用不同提示。
 
-网页点击或打开会话时，并行读取渐进历史并通过带 CSRF 的重连接口自动连接原生 owner。首屏不等待激活完成，切换会话取消旧页面请求，首次历史读取失败会自动重试。后台阅读、轮询和通知监听本身只订阅状态。打开会话、发送、处理授权或点击“重新连接”时，优先等待后台订阅；仍无 owner 才通过已有 `codex://threads/…` 链接让原 App 加载聊天，最多等待约 20 秒。该兜底可能切换桌面当前聊天，不调用第二个 app-server，不改 provider。连接失败时操作尚未发送，草稿保留。原 App 因 provider 缺失等配置问题无法恢复的聊天，网关也不会擅自迁移。
+网页打开已确认 APP 来源的会话时，并行读取渐进历史并通过带 CSRF 的重连接口自动连接原生 owner。深链接尚无来源信息时，先读取服务器会话元数据；确认 APP 来源及重连能力后，每次打开最多自动激活一次。缓存历史不作为激活依据，CLI 与 IDE 阅读只被动跟随原 owner，恢复须由用户明确继续。首屏不等待激活完成，切换会话取消旧页面请求，首次历史读取失败会自动重试。后台阅读、轮询和通知监听本身只订阅状态。对 APP 会话，打开、发送、处理授权或点击“重新连接”时，优先等待后台订阅；仍无 owner 才通过已有 `codex://threads/…` 链接让原 App 加载聊天，最多等待约 20 秒。该兜底可能切换桌面当前聊天，不调用第二个 app-server，不改 provider。连接失败时操作尚未发送，草稿保留。原 App 因 provider 缺失等配置问题无法恢复的聊天，网关也不会擅自迁移。
 
 CLI 来源表示创建方式，不固定当前执行进程。对 CLI 聊天，被动查询已有 Desktop owner 并定向订阅，核对 host/id/cwd/provider 后复用其执行连接；未发现 owner 时，仅显式继续才连接原生 daemon 或冷恢复。已发现 owner 但快照未到达或身份不符时不另行恢复。原生 writer 锁仍由官方运行时维护，网关不清锁、不终止持有者。详情见 [CLI 接入说明](docs/codex-cli.md)。
+
+默认目录中混合 IDE 历史的来源规则、深链接阅读及回归边界见[修复记录](.agents/notes/implemented/bug-fix/2026-11-10-default-codex-ide-inventory.md)。
 
 模型、权限、Skill 与工作模式使用独立能力字段，不借用会同时开放重命名等操作的 `canConfigure`。App 接续的 CLI 聊天使用既有 owner 通路；已连接原生 CLI 的目录、设置、Skill、计划请求和本机/SSH Goal 使用同一 daemon。读取目录不激活会话，显式设置只更新所选模型/推理强度或经策略检查的权限字段，不替换 provider、认证或 cwd。原生 CLI 权限以 resume 的实际配置与 thread/settings/updated 事件为准，不把请求值投影为已生效；权限策略读取来自执行端，不依赖网关电脑的桌面开关。
 
