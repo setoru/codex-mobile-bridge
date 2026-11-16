@@ -964,6 +964,7 @@ for(const nextAction of ['reopen','retry'])test('recovery captures the source on
  expect(requests).toHaveLength(2);expect(requests[1].body.sourceContext).toBe(sourceContext);
  if(nextAction==='retry')await menu.getByRole('button',{name:'重试',exact:true}).click();
  else{
+  await page.keyboard.press('Escape');await expect(menu.getByRole('button',{name:'从会话恢复',exact:true})).toBeVisible();
   await page.keyboard.press('Escape');await expect(menu).toBeHidden();
   await row.focus();await page.keyboard.press('Shift+F10');
   await menu.getByRole('button',{name:'从会话恢复',exact:true}).click();
