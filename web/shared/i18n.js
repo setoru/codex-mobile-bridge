@@ -359,6 +359,7 @@ const en={
 "新聊天已创建，但继承设置尚未确认；请检查新会话，不要重复创建":"The new chat was created, but its inherited settings are not confirmed. Check the new chat; do not create another one.",
 "新聊天权限配置与实际沙箱不一致；请核对新会话，不要重复创建":"The new chat's permission settings do not match its actual sandbox. Check the new chat; do not create another one.",
 "无法确认原接入的账号身份，请先核对 Codex 接入":"The original connection's account identity cannot be confirmed. Check the Codex connection first.",
+"无法核验原接入配置，请先核对源会话":"The original connection configuration cannot be verified. Check the source chat first.",
 "正在读取源会话设置…":"Reading source chat settings…",
 "此会话来源暂不支持从会话恢复":"This chat source does not yet support continuing in a new chat",
 "源会话未提供可核验的工作区权限配置，请先核对原会话":"The source chat does not provide verifiable workspace permission settings. Check the source chat first.",

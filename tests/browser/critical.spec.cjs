@@ -937,15 +937,24 @@ test('a recovery request missing from the server is continued explicitly with th
  await page.evaluate(()=>{openChat=window.__recoveryNavigation.openChat;loadList=window.__recoveryNavigation.loadList;delete window.__recoveryNavigation;});
 });
 
-test('recovery captures the source when opening its menu before an external account change',async({page})=>{
- const sourceContext='a'.repeat(64),requests=[];let changed=false;
+for(const nextAction of ['reopen','retry'])test('recovery captures the source on menu opening and recaptures it for '+nextAction+' after a known failure',async({page})=>{
+ const sourceContext='a'.repeat(64),changedSource='b'.repeat(64),created='aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee',requests=[],receipts=new Map();let changed=false;
  await page.route('**/api/sessions/*/recover?**',async route=>{
-  const request=route.request(),body=request.postDataJSON();requests.push({method:request.method(),body});
-  return route.fulfill({json:body?{operationId:body.id,status:'failed',phase:'validating',id:null,host:'local',sourceContext,
-   message:'原接入或账号已变化，尚未创建新会话'}:{operationId:null,status:'idle',id:null,host:'local',sourceContext:changed?'b'.repeat(64):sourceContext}});
+  const request=route.request(),body=request.postDataJSON(),operation=new URL(request.url()).searchParams.get('id');requests.push({method:request.method(),body});
+  if(body){
+   const failed=body.sourceContext!==(changed?changedSource:sourceContext);
+   const result={operationId:body.id,status:failed?'failed':'confirmed',phase:failed?'validating':'complete',id:failed?null:created,host:'local',sourceContext:body.sourceContext,
+    message:failed?'原接入或账号已变化，尚未创建新会话':''};
+   receipts.set(body.id,result);return route.fulfill({json:result});
+  }
+  return route.fulfill({json:operation?receipts.get(operation):{operationId:null,status:'idle',id:null,host:'local',sourceContext:changed?changedSource:sourceContext}});
  });
  await ready(page,'session-menu');await expect(page.locator('#login')).toBeHidden();
- await page.evaluate(async()=>{await BridgeFeatures.load('chat');BridgeI18n.setLanguage('zh');});
+ await page.evaluate(async()=>{
+  await BridgeFeatures.load('chat');BridgeI18n.setLanguage('zh');
+  window.__recoveryNavigation={openChat,loadList,opened:[]};
+  openChat=async(id,host)=>window.__recoveryNavigation.opened.push({id,host});loadList=async()=>{};
+ });
  const row=page.locator('#sessions .session').first(),menu=page.locator('dialog.session-menu');
  await row.focus();await page.keyboard.press('Shift+F10');
  await expect(menu).toBeVisible();await expect.poll(()=>requests.length).toBe(1);
@@ -953,5 +962,17 @@ test('recovery captures the source when opening its menu before an external acco
  await menu.getByRole('button',{name:'从会话恢复',exact:true}).click();
  await expect(menu.getByRole('alert')).toHaveText('原接入或账号已变化，尚未创建新会话');
  expect(requests).toHaveLength(2);expect(requests[1].body.sourceContext).toBe(sourceContext);
- await menu.getByRole('button',{name:'返回会话菜单',exact:true}).click();
+ if(nextAction==='retry')await menu.getByRole('button',{name:'重试',exact:true}).click();
+ else{
+  await page.keyboard.press('Escape');await expect(menu).toBeHidden();
+  await row.focus();await page.keyboard.press('Shift+F10');
+  await menu.getByRole('button',{name:'从会话恢复',exact:true}).click();
+ }
+ await expect(menu).toBeHidden();
+ const writes=requests.filter(request=>request.method==='POST');expect(writes).toHaveLength(2);
+ expect(writes.map(request=>request.body.sourceContext)).toEqual([sourceContext,changedSource]);
+ expect(writes[1].body.id).not.toBe(writes[0].body.id);
+ expect(receipts.get(writes[0].body.id).sourceContext).toBe(sourceContext);
+ expect(await page.evaluate(()=>window.__recoveryNavigation.opened)).toEqual([{id:created,host:'local'}]);
+ await page.evaluate(()=>{openChat=window.__recoveryNavigation.openChat;loadList=window.__recoveryNavigation.loadList;delete window.__recoveryNavigation;});
 });

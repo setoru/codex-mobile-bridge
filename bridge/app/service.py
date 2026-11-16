@@ -59,7 +59,7 @@ from bridge.features.sessions.tool_images import TOOL_IMAGE_CACHE, public_turns
 from bridge.features.accounts.account import Account
 from bridge.features.accounts.accounts import Accounts, operation
 from bridge.features.accounts.operation_gate import OperationGate
-from bridge.features.accounts.draft_identity import codex_account_identity, draft_identity
+from bridge.features.accounts.draft_identity import codex_account_identity, codex_configuration_identity, draft_identity
 from bridge.features.accounts.cli_access import CliAccess
 from bridge.features.accounts.models import valid_model_id
 from bridge.features.sessions.goal import GoalRPC, GoalError, GoalUnavailable, GoalUnsupported, goal_activation, goal_identity, normalize_goal_result, normalize_ui_locale, goal_command_fingerprint, goal_state_confirms_command, native_goal_absent, normalize_goal, plan_goal_command, read_native_goal
@@ -722,7 +722,8 @@ class Bridge:
         if self.local:
             result = {'directory': project_directory(cwd, expected=expected),
                       'home': str(self.codex_home.resolve()),
-                      'account': codex_account_identity(self.codex_home, provider, shared_auth=True)}
+                      'account': codex_account_identity(self.codex_home, provider, shared_auth=True),
+                      'configuration': codex_configuration_identity(self.codex_home, cwd, provider)}
             alias = None
         else:
             alias = self.hosts.hosts().get(self.host, {}).get('alias')
@@ -732,14 +733,16 @@ class Bridge:
             source += '\nrequest = ' + payload({'cwd': cwd, 'expected': expected, 'provider': provider}) + '\n'
             source += ('home = Path(os.environ.get("CODEX_HOME", str(Path.home()/".codex"))).resolve()\n'
                        'print(json.dumps({"directory": project_directory(request["cwd"], expected=request["expected"]), '
-                       '"home": str(home), "account": codex_account_identity(home, request["provider"], shared_auth=True)}))\n')
+                       '"home": str(home), "account": codex_account_identity(home, request["provider"], shared_auth=True), '
+                       '"configuration": codex_configuration_identity(home, request["cwd"], request["provider"])}))\n')
             result = ssh_read(alias, source)
             if self.cli_sessions.remote_home is not None and str(self.cli_sessions.remote_home) != result['home']:
                 raise ValueError('原 SSH Codex 配置目录已变化')
         if not result.get('account'):
             raise ValueError('无法确认原接入的账号身份，请先核对 Codex 接入')
         return {'directoryIdentity': result['directory'],
-                'identity': {'home': result['home'], 'account': result['account'], 'host': self.host, 'alias': alias}}
+                'identity': {'home': result['home'], 'account': result['account'],
+                             'configuration': result['configuration'], 'host': self.host, 'alias': alias}}
 
     def _recovery_source(self, thread_id, source_context):
         from bridge.features.sessions.create import creation_settings, verify_creation_settings
@@ -813,7 +816,9 @@ def created(identifier):
 try:
     home = Path(os.environ.get('CODEX_HOME', str(Path.home()/'.codex'))).resolve()
     expected = request['identity']
-    if str(home) != expected['home'] or codex_account_identity(home, request['settings']['modelProvider'], shared_auth=True) != expected['account']:
+    if (str(home) != expected['home'] or
+        codex_account_identity(home, request['settings']['modelProvider'], shared_auth=True) != expected['account'] or
+        codex_configuration_identity(home, request['cwd'], request['settings']['modelProvider']) != expected['configuration']):
         raise ValueError('原 SSH 接入或账号已变化，未创建新会话')
     project_directory(request['cwd'], expected=request['directoryIdentity'])
     runtime = shutil.which('codex') or str(Path.home()/'.local/bin/codex')

@@ -450,7 +450,14 @@ function sessionMenuContext(chat,provider='codex'){
       if(initial.error)throw initial.error;
       let result=initial.result;
       if(!recoveryCurrent())throw Error('连接或账号已变化，请重新打开会话菜单');
-      const fresh=mode==='start'&&!operationId&&['idle','confirmed','failed'].includes(result.status)||mode==='retry'&&result.status==='failed'&&!result.id;
+      const retry=(mode==='start'||mode==='retry')&&result.status==='failed'&&result.id===null;
+      if(retry){
+        operationId=undefined;sourceContext=undefined;
+        result=await read();
+        if(!recoveryCurrent())throw Error('连接或账号已变化，请重新打开会话菜单');
+      }
+      const fresh=(mode==='start'||retry)&&!operationId&&
+        (result.status==='idle'||result.status==='confirmed'||result.status==='failed'&&result.id===null);
       const submitting=fresh||mode==='continue'&&result.status==='not_submitted';
       if(submitting&&!validSource(sourceContext))throw Error('尚未确认原接入身份，请重新打开会话菜单');
       if(fresh){
@@ -485,6 +492,7 @@ function sessionMenuContext(chat,provider='codex'){
         try{result=remember(await read());}catch(error){result={...result,status:'unknown',message:error.message};}
       }
       report(result);
+      if(result.status==='failed'&&result.id===null&&stored().id===operationId)sessionStorage.removeItem(key);
       if(result.status==='confirmed'){
         if(stored().id===operationId)sessionStorage.removeItem(key);
         if(recoveryCurrent()){

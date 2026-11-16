@@ -28,6 +28,7 @@ from bridge.clients.desktop_app import DesktopApp
 from bridge.features.accounts.models import model_catalog, model_ids, valid_model_id
 from bridge.clients.codex.catalog import Catalog, ModelStore, MODEL_REFRESH_SECONDS
 from bridge.features.accounts.info import AccountInfo
+from bridge.features.accounts.draft_identity import token_owner
 from bridge.features.accounts.operation_gate import OperationGate
 from bridge.features.accounts.reset_forecast import ResetForecast
 from bridge.clients.codex.configuration import magpie_managed
@@ -64,17 +65,6 @@ def private_bytes(path, content):
 
 def private_json(path, value):
     private_bytes(path, json.dumps(value, ensure_ascii=False).encode())
-
-
-def token_owner(auth):
-    tokens = auth.get('tokens') or {}
-    try:
-        encoded = tokens['id_token'].split('.')[1]
-        claims = json.loads(base64.urlsafe_b64decode(encoded + '=' * (-len(encoded) % 4)))
-        # These are local native-login records, not independent token validation.
-        return [tokens.get('account_id'), claims.get('sub'), claims.get('email')]
-    except (ValueError, KeyError, IndexError, TypeError):
-        return None
 
 
 def operation(method=None, *, host=None, project=None, entry_only=False):

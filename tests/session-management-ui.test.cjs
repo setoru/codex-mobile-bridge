@@ -169,17 +169,60 @@ test('reopening a running recovery follows it with reads until completion',async
  assert.deepEqual(ui.opened,[{id:'created',host:'local'}]);
 });
 test('a rejected recovery can be explicitly retried with a new operation after its inputs are corrected',async()=>{
- const ui=fixture(),chat=ui.row('source',1);let writes=0,sequence=0,lastOperation;
+ const ui=fixture(),chat=ui.row('source',1),changedSource='b'.repeat(64),receipts=new Map();let writes=0,sequence=0,activeSource=sourceContext;
  ui.context.uuid=()=> 'operation-'+(++sequence);
  ui.context.api=async(url,body)=>{
   ui.requests.push({url,body});
-  if(body){writes++;lastOperation=body.id;return {operationId:body.id,status:writes===1?'failed':'confirmed',phase:writes===1?'validating':'complete',id:writes===1?null:'created',host:'local',message:'原目录不存在'};}
-  return writes?{operationId:lastOperation,status:'failed',phase:'validating',id:null,host:'local',sourceContext}:{status:'idle',operationId:null,sourceContext};
+  if(body){
+   writes++;const failed=writes===1||body.sourceContext!==activeSource;
+   const result={operationId:body.id,status:failed?'failed':'confirmed',phase:failed?'validating':'complete',id:failed?null:'created',host:'local',sourceContext:body.sourceContext,message:failed?'原目录不存在':''};
+   receipts.set(body.id,result);activeSource=changedSource;return result;
+  }
+  const operation=new URL(url,'http://fixture.test').searchParams.get('id');
+  return operation?receipts.get(operation):{status:'idle',operationId:null,id:null,sourceContext:activeSource};
  };
  const menu=ui.context.sessionMenuContext(chat);
  assert.equal((await menu.recover()).status,'failed');
  assert.equal((await menu.recover(()=>{},{mode:'retry'})).status,'confirmed');
  const submitted=ui.requests.filter(row=>row.body);assert.equal(submitted.length,2);assert.notEqual(submitted[0].body.id,submitted[1].body.id);
+ assert.equal(submitted[0].body.sourceContext,sourceContext);assert.equal(submitted[1].body.sourceContext,changedSource);
+ assert.equal(receipts.get(submitted[0].body.id).sourceContext,sourceContext);
+});
+test('reopening a failed recovery that created nothing captures the corrected source for a new operation',async()=>{
+ for(const replaceMenu of [true,false]){
+ const ui=fixture(),chat=ui.row('source',1),changedSource='b'.repeat(64);let activeSource=sourceContext,sequence=0;
+ const receipts=new Map();ui.context.uuid=()=> 'operation-'+(++sequence);
+ ui.context.api=async(url,body)=>{
+  ui.requests.push({url,body});
+  if(body){
+   const failed=body.sourceContext!==activeSource;
+   const result={operationId:body.id,status:failed?'failed':'confirmed',phase:failed?'validating':'complete',id:failed?null:'created',host:'local',sourceContext:body.sourceContext};
+   receipts.set(body.id,result);return result;
+  }
+  const operation=new URL(url,'http://fixture.test').searchParams.get('id');
+  return operation?receipts.get(operation):{status:'idle',operationId:null,id:null,sourceContext:activeSource};
+ };
+ const original=ui.context.sessionMenuContext(chat);activeSource=changedSource;
+ const failed=await original.recover();assert.equal(failed.status,'failed');assert.equal(failed.id,null);
+ const reopened=await (replaceMenu?ui.context.sessionMenuContext(chat):original).recover();
+ assert.equal(reopened.status,'confirmed');
+ const writes=ui.requests.filter(row=>row.body);
+ assert.equal(writes.length,2);assert.notEqual(writes[1].body.id,writes[0].body.id);
+ assert.equal(writes[0].body.sourceContext,sourceContext);assert.equal(writes[1].body.sourceContext,changedSource);
+ assert.equal(receipts.get(writes[0].body.id).sourceContext,sourceContext);
+ }
+});
+test('retry does not rebind a pending recovery or a failed recovery with a created or unconfirmed destination',async()=>{
+ for(const [status,id] of [['running','created'],['unknown',null],['unknown','created'],['not_submitted','created'],['failed','created'],['failed',undefined]]){
+  const ui=fixture(),chat=ui.row('source',1),key='session-recovery:'+JSON.stringify(['gateway','local','source']);
+  ui.storage.set(key,JSON.stringify({id:'previous',sourceContext}));
+  const saved={operationId:'previous',status,host:'local',sourceContext,...(id===undefined?{}:{id})};
+  ui.context.api=async(url,body)=>{ui.requests.push({url,body});return url.includes('id=')?saved:{status:'idle',id:null,sourceContext:'b'.repeat(64)};};
+  const result=await ui.context.sessionMenuContext(chat).recover(()=>{},{mode:'retry',isVisible:()=>false});
+  assert.equal(result.operationId,'previous');assert.equal(result.sourceContext,sourceContext);
+  assert.equal(ui.requests.length,1);assert.equal(ui.requests.filter(row=>row.body).length,0);
+  assert.deepEqual(JSON.parse(ui.storage.get(key)),{id:'previous',sourceContext});
+ }
 });
 test('a recovery deduplicated by the server follows the returned operation identity',async()=>{
  const ui=fixture(),chat=ui.row('source',1);
