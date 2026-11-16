@@ -766,6 +766,74 @@ test('new-chat models use shared choices before the first input', async ({page},
   }
 });
 
+test('Codex new-chat names are optional and preserve explicit titles and uncertain requests', async ({page}, testInfo) => {
+  const wsl='wsl:'+'a'.repeat(32),independent='codex:'+'b'.repeat(32),requests=[];
+  let accept=false;
+  await page.route('**/api/projects**',route=>{
+    const url=new URL(route.request().url()),entry=url.searchParams.get('entry'),host=entry||'local';
+    const value=url.pathname.endsWith('/trust')?{required:false}:{
+      projects:entry?[]:['desktop','cli'].map(type=>({key:type+'|local|fixture',type,host,cwd:'/fixture/project',name:'Project'})),
+      environments:['desktop','cli'].map(type=>({key:type+'|'+host,type,host,name:'Local'})),
+    };
+    return route.fulfill({json:value});
+  });
+  await page.route('**/api/sessions**',route=>{
+    if(route.request().method()!=='POST'||new URL(route.request().url()).pathname!=='/api/sessions')return route.continue();
+    const body=route.request().postDataJSON(),entry=new URL(route.request().url()).searchParams.get('entry');
+    requests.push({body,entry});
+    return route.fulfill({status:accept?200:503,json:accept
+      ?{id:'aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee',host:entry||'local',message:'聊天已创建，可以直接发送消息'}
+      :{error:'Fixture creation result is unknown'}});
+  });
+  await ready(page,'session-menu');
+  await page.evaluate(async wsl=>{
+    await BridgeFeatures.load('chat');
+    clientNavigation.wslSupported=true;
+    clientNavigation.clients.find(row=>row.id==='codex').entries=[{id:'desktop',enabled:true},{id:wsl,kind:'wsl-cli',enabled:true,name:'WSL fixture'}];
+    // The creation response is synthetic; only the form and request are under test.
+    window.__autoTitleNavigation={openChat,loadList};openChat=async()=>{};loadList=async()=>{};
+  },wsl);
+  const dialog=page.locator('#new-chat-dialog'),title=dialog.locator('#new-chat-title'),submit=dialog.locator('#new-chat-submit');
+  const language=async value=>page.evaluate(value=>{$('phone-language').value=value;$('phone-language').onchange();},value);
+  try{
+    for(const target of [{host:'local',kind:'desktop'},{host:'local',kind:'cli'},{host:wsl,kind:'wsl'},{host:independent,kind:'cli'}]){
+      accept=false;
+      await page.evaluate(target=>{currentHost=target.host;listSource=target.kind;},target);
+      await page.locator('#new-chat').click();
+      await expect(submit).toBeEnabled();await expect(title).toHaveValue('');
+      expect(await title.evaluate(node=>node.required)).toBe(false);
+      await language('en');await expect(title).toHaveValue('');await expect(title).toHaveAccessibleName('Chat name (optional)');
+      await expect(title).toHaveAttribute('placeholder','Leave blank to use the native title');
+      await language('zh');await expect(title).toHaveValue('');await expect(title).toHaveAccessibleName('聊天名称（可选）');
+      await expect(title).toHaveAttribute('placeholder','留空使用原生标题');
+      if(target.kind==='desktop'){
+        await dialog.locator('#new-chat-type').selectOption('cli');await expect(title).toHaveAttribute('placeholder','留空使用原生标题');
+        await expect(title).toHaveValue('');
+        await dialog.locator('#new-chat-type').selectOption('desktop');await expect(title).toHaveAttribute('placeholder','留空使用原生标题');
+        await expect(submit).toBeEnabled();
+      }
+      expect(await dialog.evaluate(node=>node.scrollWidth<=node.clientWidth+1)).toBe(true);
+      if(target.kind==='desktop')await testInfo.attach('optional-chat-name',{body:await dialog.screenshot(),contentType:'image/png'});
+      const start=requests.length;
+      await submit.click();await expect.poll(()=>requests.length).toBe(start+1);await expect(submit).toBeEnabled();
+      expect(requests[start].body.title).toBe('');expect(requests[start].body.kind).toBe(target.kind==='wsl'?undefined:target.kind);
+      expect(requests[start].entry).toBe(target.host==='local'?null:target.host);
+      await expect(title).toHaveValue('');await expect(dialog).toBeVisible();
+      await submit.click();await expect.poll(()=>requests.length).toBe(start+2);await expect(submit).toBeEnabled();
+      expect(requests[start+1].body.id).toBe(requests[start].body.id);
+      await title.fill('  手动聊天名称  ');await language('en');await expect(title).toHaveValue('  手动聊天名称  ');
+      await language('zh');await dialog.getByRole('button',{name:'关闭新建聊天',exact:true}).click();
+      await page.locator('#new-chat').click();await expect(title).toHaveValue('  手动聊天名称  ');
+      accept=true;await submit.click();await expect.poll(()=>requests.length).toBe(start+3);await expect(dialog).toBeHidden();
+      expect(requests[start+2].body.title).toBe('手动聊天名称');expect(requests[start+2].body.id).not.toBe(requests[start].body.id);
+      await expect(title).toHaveValue('');
+      expect(await page.evaluate(()=>sessionStorage.getItem('new-chat-attempt'))).toBeNull();
+    }
+  }finally{
+    await page.evaluate(()=>{openChat=window.__autoTitleNavigation.openChat;loadList=window.__autoTitleNavigation.loadList;delete window.__autoTitleNavigation;});
+  }
+});
+
 test('cached new-chat choices survive catalog verification', async ({page}) => {
   await ready(page,'session-menu');await page.evaluate(async()=>{await BridgeFeatures.load('chat');BridgeI18n.setLanguage('zh');});
   await page.evaluate(()=>{

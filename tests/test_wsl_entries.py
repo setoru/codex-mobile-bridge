@@ -695,6 +695,35 @@ class WslSessionTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError,'不同内容'):
             self.entry.create_chat(project,'Chosen',attempt,model_options={**selected,'model':'other'})
 
+    def test_unnamed_wsl_creation_preserves_request_identity_and_durable_empty_thread(self):
+        self.entry.store.list = lambda **kwargs: [{'cwd': '/home/fixture/project'}]
+        self.entry.read = lambda *args, **kwargs: {'cwd': '/home/fixture/project'}
+        original = self.entry.server.request
+        created = str(uuid.uuid4())
+        def request(method, params):
+            if method == 'thread/start':
+                self.entry.server.calls.append((method, copy.deepcopy(params)))
+                self.entry.server.thread['id'] = created
+                return {'thread': copy.deepcopy(self.entry.server.thread)}
+            return original(method, params)
+        self.entry.server.request = request
+        project = self.entry.host + '|/home/fixture/project'
+        attempt = str(uuid.uuid4())
+        for title in (None, '', '   '):
+            self.assertEqual(self.entry.create_chat(project, title, attempt)['id'], created)
+        calls = self.entry.server.calls
+        self.assertEqual(sum(method == 'thread/start' for method, _ in calls), 1)
+        self.assertIn(('thread/read', {'threadId': created, 'includeTurns': True}), calls)
+        self.assertFalse(any(method in ('thread/name/set', 'turn/start') for method, _ in calls))
+        self.assertEqual(json.loads(self.entry.creations_path.read_text())[attempt]['title'], '')
+        with self.assertRaisesRegex(ValueError, '不同内容'):
+            self.entry.create_chat(project, 'Manual name', attempt)
+        with patch.object(self.entry, 'runtime') as runtime:
+            for title in (False, [], 'a' * 121, 'x\ny', 'x\x85y', 'x\u2028y'):
+                with self.assertRaises(ValueError):
+                    self.entry.create_chat(project, title, str(uuid.uuid4()))
+            runtime.assert_not_called()
+
     def test_passive_connection_does_not_start_codex_and_explicit_connect_can_start_it(self):
         self.entry.server = None
         info = {'user': 'fixture', 'homes': [{'home': self.row['home'], 'daemon': None}]}
@@ -748,6 +777,79 @@ class WslSessionTests(unittest.TestCase):
                         action()
                     self.assertFalse(any(method in ('thread/resume', 'turn/start', 'turn/interrupt',
                                                      'thread/settings/update') for method, _ in entry.server.calls))
+
+    def test_native_title_refresh_uses_name_then_preview_without_stale_store_name(self):
+        self.entry.store.get = lambda identifier: {'id': identifier, 'cwd': '/home/fixture/project',
+            'model_provider': 'magpie', 'name': 'Stale store name', 'title': 'Old input',
+            'display_title': 'Stale display name'}
+        self.entry.server.thread.update(name=None, preview='Original prompt')
+        session = self.entry.session(self.identifier)
+        self.assertEqual(session.state['title'], 'Original prompt')
+        self.assertEqual((session.state['threadName'], session.state['threadPreview']), (None, 'Original prompt'))
+        calls = list(self.entry.server.calls)
+        for name, expected in [('Automatic title', 'Automatic title'), ('Manual title', 'Manual title'),
+                               (None, 'Original prompt')]:
+            self.entry._event({'method': 'thread/name/updated', 'params': {
+                'threadId': self.identifier, 'threadName': name}}, self.entry.generation)
+            self.assertEqual((session.state['title'], session.state['threadName']), (expected, name))
+            self.assertNotIn('threadName', session.view())
+            self.assertNotIn('threadPreview', session.view())
+        self.assertEqual(self.entry.server.calls, calls)
+        self.entry.server.thread['preview'] = ''
+        self.entry._refresh(session)
+        self.assertEqual(session.state['title'], '未命名聊天')
+
+    def test_old_wsl_read_cannot_overwrite_newer_name_event_or_name_removal(self):
+        self.entry.server.thread.update(name='Initial name', preview='Original prompt')
+        session = self.entry.session(self.identifier)
+        original = self.entry.server.request
+        for name, expected in [('Manual title', 'Manual title'), (None, 'Original prompt')]:
+            with self.subTest(name=name):
+                started, release = threading.Event(), threading.Event()
+                old_thread = {**self.entry.server.thread, 'name': 'Old response name'}
+                def request(method, params):
+                    if method == 'thread/read' and not started.is_set():
+                        started.set()
+                        if not release.wait(2):
+                            raise TimeoutError('name-event fixture was not released')
+                        return {'thread': old_thread}
+                    return original(method, params)
+                self.entry.server.request = request
+                errors = []
+                def refresh():
+                    try:
+                        self.entry._refresh(session)
+                    except Exception as exc:
+                        errors.append(exc)
+                worker = threading.Thread(target=refresh)
+                worker.start()
+                try:
+                    self.assertTrue(started.wait(2))
+                    self.entry._event({'method': 'thread/name/updated', 'params': {
+                        'threadId': self.identifier, 'threadName': name}}, self.entry.generation)
+                finally:
+                    release.set()
+                    worker.join(2)
+                    self.entry.server.request = original
+                self.assertFalse(worker.is_alive())
+                self.assertEqual(errors, [])
+                self.assertEqual((session.state['title'], session.state['threadName']), (expected, name))
+        self.entry.server.thread['name'] = 'Later native title'
+        self.entry._refresh(session)
+        self.assertEqual(session.state['title'], 'Later native title')
+
+    def test_wsl_name_events_ignore_old_generation_disconnected_or_unknown_sessions(self):
+        self.entry.server.thread.update(name='Current name', preview='Original prompt')
+        session = self.entry.session(self.identifier)
+        initial_sequence = session.sequence
+        message = {'method': 'thread/name/updated', 'params': {'threadId': self.identifier, 'threadName': 'Ignore'}}
+        self.entry._event(message, 'old-generation')
+        self.entry._event({**message, 'params': {'threadId': str(uuid.uuid4()), 'threadName': 'Ignore'}}, self.entry.generation)
+        self.entry._event({**message, 'params': {'threadId': self.identifier, 'threadName': 7}}, self.entry.generation)
+        session.connected = False
+        self.entry._event(message, self.entry.generation)
+        self.assertEqual(session.sequence, initial_sequence)
+        self.assertEqual(session.state['title'], 'Current name')
 
     def test_passive_refresh_keeps_saved_history_when_native_identity_differs(self):
         self.entry.server.thread.update(id=str(uuid.uuid4()), cwd='/another/project')

@@ -206,11 +206,12 @@ class CliSessions:
         """Fail closed on unknown native status before a local account change."""
         return self.daemon_status() != 'stopped'
 
-    def create(self, cwd, title, on_start=None, on_created=None, model=None, effort=None):
+    def create(self, cwd, title='', on_start=None, on_created=None, model=None, effort=None):
         """An explicit new CLI chat; no turn is started."""
         if not isinstance(cwd, str) or not cwd or (self.alias is None and not Path(cwd).is_dir()):
             raise AppServerUnavailable('CLI 项目目录不存在')
-        from bridge.features.sessions.create import model_overrides
+        from bridge.features.sessions.create import model_overrides, normalize_creation_title
+        title = normalize_creation_title(title)
         overrides = model_overrides(model, effort)
         info = self._connect_explicit()
         if self.alias is None and Path(info['codexHome']) != self.home:
@@ -242,7 +243,8 @@ class CliSessions:
                                         'permissions': {key: copy.deepcopy(result[key]) for key in
                                                         ('approvalPolicy', 'approvalsReviewer', 'sandbox', 'activePermissionProfile')
                                                         if key in result}, 'goal': None}
-        self.client.request('thread/name/set', {'threadId': thread_id, 'name': title})
+        if title:
+            self.client.request('thread/name/set', {'threadId': thread_id, 'name': title})
         return self.refresh(thread_id)
 
     def archive_call(self, thread_id, archived, identifiers, disconnect=False, check_scope=None):
@@ -458,6 +460,7 @@ class CliSessions:
             starting = self.states.get(thread_id) or {}
             starting_model = starting.get('latestModel')
             starting_effort = starting.get('latestReasoningEffort')
+            starting_name_revision = (self.metadata.get(thread_id) or {}).get('nameRevision', 0)
             starting_turn_status = {turn.get('turnId'): turn.get('status')
                                     for turn in starting.get('turns', [])}
         result = self.client.request('thread/read', {'threadId': thread_id, 'includeTurns': True},
@@ -482,6 +485,9 @@ class CliSessions:
                 pending = list(self.requests.get(thread_id, {}).values())
                 state = self._state(thread, pending, metadata)
                 previous = self.states.get(thread_id) or {}
+                if metadata.get('nameRevision', 0) != starting_name_revision:
+                    state['threadName'] = metadata.get('threadName')
+                    state['title'] = state['threadName'] or state['threadPreview'] or '未命名聊天'
                 previous_turns = {turn.get('turnId'): turn for turn in previous.get('turns', [])
                                   if turn.get('turnId')}
                 read_turn_ids = {turn.get('turnId') for turn in state['turns']}
@@ -938,6 +944,7 @@ class CliSessions:
                 row['params'] = {'model': turn['model'], 'effort': turn.get('reasoningEffort')}
             turns.append(row)
         state = {'id': thread['id'], 'title': thread.get('name') or thread.get('preview') or '未命名聊天',
+                'threadName': thread.get('name'), 'threadPreview': thread.get('preview'),
                 'cwd': thread.get('cwd') or metadata['cwd'],
                 'modelProvider': thread.get('modelProvider') or metadata['modelProvider'],
                 'latestModel': thread.get('model') or metadata['model'],
@@ -981,7 +988,8 @@ class CliSessions:
         params = event.get('params') or {}
         thread_id = params.get('threadId')
         with self.lock:
-            joined = thread_id in self.joined
+            process = self.client.process
+            joined = process is not None and self.joined.get(thread_id) is process
         if not joined:
             return
         if method == 'thread/closed' or (method == 'thread/status/changed' and
@@ -989,11 +997,27 @@ class CliSessions:
             self._invalidate(thread_id)
             return
         with self.lock:
+            if self.client.process is not process or self.joined.get(thread_id) is not process:
+                return
             state = self.states.get(thread_id)
-            if state is None:
+            if method == 'thread/name/updated':
+                name = params.get('threadName')
+                if name is not None and not isinstance(name, str):
+                    return
+                metadata = self.metadata.get(thread_id)
+                if metadata is None:
+                    return
+                metadata['nameRevision'] = metadata.get('nameRevision', 0) + 1
+                metadata['threadName'] = name
+                if state is None:
+                    self._queue_refresh(thread_id)
+                    return
+                state['threadName'] = name
+                state['title'] = name or state.get('threadPreview') or '未命名聊天'
+            elif state is None:
                 self._queue_refresh(thread_id)
                 return
-            if method == 'serverRequest/resolved':
+            elif method == 'serverRequest/resolved':
                 self.requests.get(thread_id, {}).pop(params.get('requestId'), None)
                 state['requests'] = list(self.requests.get(thread_id, {}).values())
             elif method == 'thread/settings/updated':

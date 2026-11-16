@@ -541,6 +541,73 @@ class CliSessionTests(unittest.TestCase):
         self.assertEqual(state['latestModel'], 'later-native-model')
         self.assertEqual(state['latestReasoningEffort'], 'low')
 
+    def test_native_name_events_update_title_without_reading_or_starting_a_turn(self):
+        self.fake.thread['preview'] = 'Original prompt'
+        self.sessions.attach('thread-a', explicit=True)
+        state = self.sessions.states['thread-a']
+        self.assertEqual((state['threadName'], state['threadPreview']), ('CLI task', 'Original prompt'))
+        before = len(self.fake.sent)
+        for name, expected in [('Automatic title', 'Automatic title'), ('Manual title', 'Manual title'),
+                               (None, 'Original prompt')]:
+            self.sessions._event({'method': 'thread/name/updated', 'params': {
+                'threadId': 'thread-a', 'threadName': name}})
+            state = self.states[-1][1]
+            self.assertEqual((state['title'], state['threadName']), (expected, name))
+            self.assertNotIn('threadName', normalize_state(state))
+            self.assertNotIn('threadPreview', normalize_state(state))
+        self.assertEqual(len(self.fake.sent), before)
+        count = len(self.states)
+        self.sessions._event({'method': 'thread/name/updated', 'params': {
+            'threadId': 'thread-a', 'threadName': {'unexpected': 'name'}}})
+        self.sessions._event({'method': 'thread/name/updated', 'params': {
+            'threadId': 'unjoined', 'threadName': 'Ignore'}})
+        self.assertEqual(len(self.states), count)
+        self.fake.thread.update(name=None, preview='')
+        self.assertEqual(self.sessions.refresh('thread-a')['title'], '未命名聊天')
+
+    def test_old_native_read_cannot_overwrite_newer_name_event_or_name_removal(self):
+        self.fake.thread['preview'] = 'Original prompt'
+        self.sessions.attach('thread-a', explicit=True)
+        original = self.fake.request
+        for name, expected in [('Manual title', 'Manual title'), (None, 'Original prompt')]:
+            with self.subTest(name=name):
+                started, release = threading.Event(), threading.Event()
+                old_thread = {**self.fake.thread, 'name': 'Old response name'}
+                def request(method, params, **kwargs):
+                    if method == 'thread/read' and not started.is_set():
+                        started.set()
+                        if not release.wait(2):
+                            raise TimeoutError('name-event fixture was not released')
+                        return {'thread': old_thread}
+                    return original(method, params, **kwargs)
+                self.fake.request = request
+                errors = []
+                worker = threading.Thread(target=lambda: self._refresh_error(errors))
+                worker.start()
+                try:
+                    self.assertTrue(started.wait(2))
+                    self.sessions._event({'method': 'thread/name/updated', 'params': {
+                        'threadId': 'thread-a', 'threadName': name}})
+                finally:
+                    release.set()
+                    worker.join(2)
+                    self.fake.request = original
+                self.assertFalse(worker.is_alive())
+                self.assertEqual(errors, [])
+                state = self.sessions.states['thread-a']
+                self.assertEqual((state['title'], state['threadName']), (expected, name))
+        self.fake.thread['name'] = 'Later native title'
+        self.assertEqual(self.sessions.refresh('thread-a')['title'], 'Later native title')
+
+    def test_name_event_cannot_update_a_join_from_another_connection(self):
+        self.sessions.attach('thread-a', explicit=True)
+        before = len(self.states)
+        self.fake.process = object()
+        self.sessions._event({'method': 'thread/name/updated', 'params': {
+            'threadId': 'thread-a', 'threadName': 'Stale name'}})
+        self.assertEqual(len(self.states), before)
+        self.assertEqual(self.sessions.states['thread-a']['title'], 'CLI task')
+
     def test_old_native_read_cannot_reopen_completed_turn(self):
         self.fake.thread['status'] = {'type': 'active'}
         self.fake.thread['turns'] = [{'id': 'turn-1', 'status': 'inProgress', 'items': []}]

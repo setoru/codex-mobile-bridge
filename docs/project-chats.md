@@ -15,6 +15,8 @@
 
 浏览和选择目录不会创建聊天或发送消息。Claude 需要首条消息才能创建会话，因此按钮明确标注 **创建并发送**；其他接入先创建空聊天，之后由用户输入发送。提交后若结果尚不能确认，请先检查原环境，不要重复创建。
 
+Codex 的 **聊天名称** 为可选项，默认留空，适用于 App、本机或 SSH CLI、独立配置和 WSL。填写名称时保存该名称；留空时创建未命名聊天。界面优先显示原生名称，没有名称时显示原生内容预览，都没有时显示“未命名聊天”，并跟随原生名称更新。标题的生成由原生客户端决定；Bridge 不为命名创建临时会话或发送额外模型请求。
+
 Codex App 和 DSH 的项目聊天会复用所选目录对应的原生项目。本机 Codex 目录尚未登记时，会打开电脑 App 的空白新建页，由 App 登记项目；若电脑端需要确认目录，请先完成确认，再返回重试。确认原生项目已保存后才创建聊天，登记结果未知时不会重复登记或创建。支持项目归属接口的 Codex 会核对新聊天保存后的归属，DSH 使用原生工作区 ID 创建聊天。此操作不移动已有聊天，也不改写已有项目设置。
 
 Codex 本机新目录需要 App 支持目录登记入口；旧运行时仍可沿用 App 已保存的项目。SSH 的新目录请先在电脑 App 添加为项目，再返回选择；已有 SSH 项目及 Codex CLI 创建不受此限制。DSH 的任意新目录创建需要更新后的连接器及支持原生工作区接口的 Harness；旧连接器仍可使用其已有能力，升级连接器后才显示选择其他目录的入口。DSH 没有独立 CLI 或 SSH 接入选项。
@@ -28,6 +30,8 @@ Claude Desktop Code 若提示需要信任工作区，请在电脑的 Claude Desk
 Select **New** in Web or mobile, choose a runtime environment, then select an existing project or **Choose directory**. The directory picker also offers a collapsed **New folder** action. A directory does not need an existing chat. Creating a folder does not initialize Git or overwrite files.
 
 The same picker serves Codex App, local/SSH Codex CLI, WSL Codex, Claude Desktop Code/Cowork, local/SSH Claude Code CLI, and the existing DeepSeek Harness Desktop connection. Paths belong to the selected environment. Changing environments clears an unconfirmed directory selection. Expand the short path summary to see the full path.
+
+Codex chat names are optional and blank by default across App, local/SSH CLI, independent configurations, and WSL. Entering a name saves it; leaving the field blank creates an unnamed chat. The interface displays the native name, falls back to the native message preview, then shows “Unnamed chat” when neither is available. Native name updates are reflected in the interface. Title generation belongs to the native client; Bridge does not create temporary naming sessions or send extra model requests.
 
 Browsing does not create a chat or send a message. Codex App and DSH use **Create and open**; Codex CLI and WSL use **Create chat**. Claude requires an initial message and explicitly uses **Create and send**. An uncertain submission is not replayed automatically. Codex App and DSH reuse the native project for the selected directory. A new local Codex directory opens an empty Desktop creation page so the App can register the project. Complete any folder confirmation on the computer before retrying. The bridge waits for the native project record before creating a chat and does not repeat an unconfirmed registration. Existing chats and project settings are retained. Older runtimes retain the saved-project path. For a new SSH directory, add it as a project in the computer App first; existing SSH projects and Codex CLI creation keep their current behavior. Arbitrary DSH directories require an updated connector and Harness native workspace support. DSH does not offer a separate CLI or SSH connection.
 

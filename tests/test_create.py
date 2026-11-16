@@ -198,6 +198,23 @@ class CreationTests(unittest.TestCase):
             self.assertEqual(create.call_count, 1)
             with self.assertRaises(ValueError):self.bridge.create_chat('local|p', 'Other', request)
 
+    def test_unnamed_creation_normalizes_omission_and_whitespace_in_durable_request(self):
+        request = str(uuid.uuid4())
+        with patch('bridge.app.service.create_empty', return_value=self.tid) as create, \
+             patch('bridge.app.service.open_in_desktop'):
+            for title in (None, '', '   ', '\u3000'):
+                self.assertEqual(self.bridge.create_chat('local|p', title, request)['id'], self.tid)
+            create.assert_called_once()
+            self.assertEqual(create.call_args.args[3], '')
+            self.assertEqual(json.loads(self.bridge.creations_path.read_text())[request]['title'], '')
+            self.bridge.close()
+            self.bridge = Bridge(self.root, self.root/'data')
+            self.bridge.hosts.projects = lambda: [{'key': 'local|p', 'host': 'local', 'cwd': str(self.root)}]
+            self.assertEqual(self.bridge.create_chat('local|p', None, request)['id'], self.tid)
+            create.assert_called_once()
+            with self.assertRaisesRegex(ValueError, '不同内容'):
+                self.bridge.create_chat('local|p', 'Manual name', request)
+
     def test_creation_model_identity_and_choice_are_part_of_the_durable_request(self):
         selected = {'model': 'fixture-model', 'effort': 'low', 'modelCatalogIdentity': 'account-scope'}
         catalog = {'models': [{'id': 'fixture-model', 'efforts': ['low', 'high']}], 'cache': {'identity': 'account-scope'}}
@@ -243,12 +260,14 @@ class CreationTests(unittest.TestCase):
             self.assertEqual(create.call_count, 1)
 
     def test_unknown_result_is_not_replayed(self):
-        request = str(uuid.uuid4())
-        with patch('bridge.app.service.create_empty', side_effect=CreationError('timeout')) as create:
-            with self.assertRaises(CreationError):self.bridge.create_chat('local|p', 'Test', request)
-            with self.assertRaisesRegex(CreationError, '避免重复'):self.bridge.create_chat('local|p', 'Test', request)
-            self.assertEqual(create.call_count, 1)
-            self.assertNotIn('id', json.loads(self.bridge.creations_path.read_text())[request])
+        for title in ('Test', ''):
+            with self.subTest(title=title):
+                request = str(uuid.uuid4())
+                with patch('bridge.app.service.create_empty', side_effect=CreationError('timeout')) as create:
+                    with self.assertRaises(CreationError):self.bridge.create_chat('local|p', title, request)
+                    with self.assertRaisesRegex(CreationError, '避免重复'):self.bridge.create_chat('local|p', title, request)
+                    self.assertEqual(create.call_count, 1)
+                    self.assertNotIn('id', json.loads(self.bridge.creations_path.read_text())[request])
 
     def test_failed_desktop_open_keeps_created_id(self):
         with patch('bridge.app.service.create_empty', return_value=self.tid), patch('bridge.app.service.open_in_desktop', side_effect=OSError()):
@@ -276,7 +295,9 @@ class CreationTests(unittest.TestCase):
 
     def test_only_saved_project_and_valid_title_are_accepted(self):
         with patch('bridge.app.service.create_empty') as create:
-            for project,title,request in [('unknown','ok',str(uuid.uuid4())),('local|p',' ',str(uuid.uuid4())),('local|p','a'*121,str(uuid.uuid4())),('local|p','ok',None)]:
+            invalid = ['a'*121, 1, {}, [], False, 'x\ny', 'x\x00y', 'x\x7fy', 'x\x85y', 'x\u2028y', 'x\u2029y']
+            for project,title,request in [('unknown','ok',str(uuid.uuid4())),('local|p','ok',None),
+                                          *[('local|p', title, str(uuid.uuid4())) for title in invalid]]:
                 with self.assertRaises(ValueError):self.bridge.create_chat(project,title,request)
             create.assert_not_called()
 
@@ -319,15 +340,19 @@ class CreationTests(unittest.TestCase):
         host='remote-ssh-discovered:test'
         self.bridge.hosts.state=lambda:{'remote-projects':[{'id':'r','hostId':host,'remotePath':'/remote/project'}],
                                       'codex-managed-remote-connections':[{'hostId':host,'alias':'test'}]}
-        with patch('bridge.clients.codex.remote.RemoteStore.list', return_value=[]), \
-             patch('bridge.app.service.ssh_read', return_value={'id':self.tid}) as remote, \
-             patch('bridge.app.service.open_in_desktop') as opened:
-            result=self.bridge.create_chat(host+'|r', 'quoted " title $()', str(uuid.uuid4()))
-            self.assertEqual(result['host'],host)
-            self.assertEqual(remote.call_args.args[0],'test')
-            self.assertNotIn('quoted " title $()',remote.call_args.args[1])
-            self.assertIn('create_empty(runtime, home',remote.call_args.args[1])
-            opened.assert_called_once_with(self.tid,host)
+        for title in ('quoted " title $()', None):
+            with self.subTest(title=title), \
+                 patch('bridge.clients.codex.remote.RemoteStore.list', return_value=[]), \
+                 patch('bridge.app.service.ssh_read', return_value={'id':self.tid}) as remote, \
+                 patch('bridge.app.service.open_in_desktop') as opened:
+                request = str(uuid.uuid4())
+                result=self.bridge.create_chat(host+'|r', title, request)
+                self.assertEqual(result['host'],host)
+                self.assertEqual(remote.call_args.args[0],'test')
+                self.assertNotIn('quoted " title $()',remote.call_args.args[1])
+                self.assertIn('create_empty(runtime, home',remote.call_args.args[1])
+                self.assertEqual(self.bridge.creations[request]['title'], title or '')
+                opened.assert_called_once_with(self.tid,host)
 
     def test_runtime_only_initializes_creates_names_and_materializes(self):
         script=self.root/'runtime.py'
@@ -352,8 +377,14 @@ Path(''' + repr(str(log)) + ''').write_text(json.dumps(calls))
             self.assertEqual(create_empty('runtime',self.root,str(self.root),'test'),self.tid)
         calls=json.loads(log.read_text())
         self.assertEqual([c['method'] for c in calls],['initialize','initialized','thread/start','thread/name/set','thread/read'])
+        self.assertEqual(calls[3]['params'], {'threadId': self.tid, 'name': 'test'})
         self.assertEqual(calls[-1]['params'],{'threadId':self.tid,'includeTurns':True})
         self.assertEqual(calls[2]['params'],{'cwd':str(self.root),'ephemeral':False})
+        with patch('bridge.features.sessions.create.subprocess.Popen', side_effect=spawn):
+            self.assertEqual(create_empty('runtime', self.root, str(self.root)), self.tid)
+        calls = json.loads(log.read_text())
+        self.assertEqual([c['method'] for c in calls], ['initialize', 'initialized', 'thread/start', 'thread/read'])
+        self.assertEqual(calls[-1]['params'], {'threadId': self.tid, 'includeTurns': True})
         with patch('bridge.features.sessions.create.subprocess.Popen',side_effect=spawn):
             rename_thread('runtime', self.root, self.tid, 'Renamed')
         calls=json.loads(log.read_text())

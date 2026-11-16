@@ -11,6 +11,7 @@ import sys
 import threading
 import time
 import tempfile
+import unicodedata
 import uuid
 from pathlib import Path
 from urllib.parse import urlencode
@@ -318,7 +319,20 @@ def model_overrides(model=None, effort=None):
     return {'model': model, **({'config': {'model_reasoning_effort': effort}} if effort is not None else {})}
 
 
-def create_empty(executable, codex_home, cwd, title, project=None, model=None, effort=None):
+def normalize_creation_title(value):
+    """An omitted name leaves the native thread available for automatic naming."""
+    if value is None:
+        return ''
+    if not isinstance(value, str) or any(unicodedata.category(c) in ('Cc', 'Zl', 'Zp') for c in value):
+        raise ValueError('聊天名称需为 1–120 个字符，不能包含换行或控制字符')
+    value = value.strip()
+    if len(value) > 120:
+        raise ValueError('聊天名称不能超过 120 字')
+    return value
+
+
+def create_empty(executable, codex_home, cwd, title='', project=None, model=None, effort=None):
+    title = normalize_creation_title(title)
     overrides = model_overrides(model, effort)
     supported = project is not None and _native_project_support(executable, project.get('required', False))
     def create(request):
@@ -333,7 +347,8 @@ def create_empty(executable, codex_home, cwd, title, project=None, model=None, e
             raise CreationError('聊天已创建，但模型或思考强度尚未确认，请检查原会话；不会重复创建')
         if project_id is not None and result['thread'].get('projectId') != project_id:
             raise CreationError('聊天已创建但原生项目归属未确认，请检查电脑 App，不要重复创建')
-        request('thread/name/set', {'threadId': thread_id, 'name': title})
+        if title:
+            request('thread/name/set', {'threadId': thread_id, 'name': title})
         saved = request('thread/read', {'threadId': thread_id, 'includeTurns': True})
         if project_id is not None and saved['thread'].get('projectId') != project_id:
             raise CreationError('聊天已创建但项目归属未持久化确认，请检查电脑 App，不要重复创建')

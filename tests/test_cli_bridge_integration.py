@@ -1050,6 +1050,30 @@ class CliCreationProtocolTests(unittest.TestCase):
             self.assertEqual(cli.client.request.call_args_list[0].args[1],
                              {'cwd': str(home), 'ephemeral': False, 'threadSource': 'cli'})
 
+    def test_unnamed_local_and_ssh_cli_creation_materializes_without_name_or_turn(self):
+        with tempfile.TemporaryDirectory(dir=ROOT / '.tmp') as folder:
+            home = Path(folder)
+            for alias in (None, 'fixture-ssh'):
+                for title in (None, '', '   '):
+                    with self.subTest(alias=alias, title=title):
+                        thread_id = str(uuid.uuid4())
+                        cli = CliSessions(home, lambda *_: None, lambda: None, alias=alias)
+                        cli.client.process = object()
+                        cli._connect_explicit = Mock(return_value={'codexHome': str(home)})
+                        thread = {'id': thread_id, 'cwd': str(home), 'modelProvider': 'fixture',
+                                  'model': 'fixture-model', 'status': {'type': 'idle'}, 'turns': []}
+                        def request(method, params, **kwargs):
+                            if method in ('thread/start', 'thread/read'):
+                                return {'thread': thread}
+                            self.fail('Unexpected unnamed creation operation: ' + method)
+                        cli.client.request = Mock(side_effect=request)
+                        result = cli.create(str(home), title)
+                        self.assertEqual(result['id'], thread_id)
+                        self.assertEqual(result['modelProvider'], 'fixture')
+                        self.assertEqual(result['title'], '未命名聊天')
+                        self.assertEqual([call.args[0] for call in cli.client.request.call_args_list],
+                                         ['thread/start', 'thread/read'])
+
 
 if __name__ == '__main__':
     unittest.main()

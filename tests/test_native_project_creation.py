@@ -36,10 +36,20 @@ class NativeCodexProjects(unittest.TestCase):
             return {}
         self.fail('Unexpected runtime operation: ' + method)
 
-    def create(self, project=None, supported=True):
+    def create(self, project=None, supported=True, title='A chat'):
         with patch('bridge.features.sessions.create._native_project_support', return_value=supported), \
              patch('bridge.features.sessions.create._runtime_operation', side_effect=lambda a,b,c,run: run(self.request)):
-            return create_empty('fixture', self.cwd, self.cwd, 'A chat', project=project)
+            return create_empty('fixture', self.cwd, self.cwd, title, project=project)
+
+    def test_unnamed_project_chat_keeps_membership_and_materializes_without_name_write(self):
+        for title in (None, '', '   '):
+            with self.subTest(title=title):
+                self.calls.clear()
+                self.pages = [{'data': [{'id': 'native-project', 'name': 'Project', 'roots': [{'path': self.cwd}]}]}]
+                self.assertEqual(self.create({'name': 'Project', 'required': True}, title=title), self.thread_id)
+                self.assertEqual([method for method, _ in self.calls], ['project/list', 'thread/start', 'thread/read'])
+                self.assertEqual(self.calls[1][1]['projectId'], 'native-project')
+                self.assertEqual(self.calls[-1][1], {'threadId': self.thread_id, 'includeTurns': True})
 
     def test_runtime_only_project_does_not_claim_native_sidebar_registration(self):
         with self.assertRaisesRegex(CreationUnavailable, '电脑 App 项目与运行时'):

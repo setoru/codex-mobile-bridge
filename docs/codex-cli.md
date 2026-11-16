@@ -26,6 +26,8 @@ Codex CLI 接入在 Codex 账号管理中保存；Claude CLI 接入在 Claude �
 
 在 Codex 新建聊天中选择 CLI，可使用已有本机或 SSH CLI 会话记录中的项目目录；新建仅创建会话，不发送第一条消息。读取项目列表不激活会话，提交创建时才连接原生运行时。来源标记保持 CLI，即使之后由桌面 App 接续也不改变。
 
+名称为可选项，默认留空。创建时仅对手动填写的名称调用 `thread/name/set`；空名聊天保持原生未命名状态。界面依次使用原生名称、原生内容预览和“未命名聊天”，并接收 `thread/name/updated` 更新。生成标题由原生客户端负责；网关不创建标题临时会话、不发送额外模型请求，也不维护自动命名回执。具体行为见[可选名称记录](../.agents/notes/implemented/feature/2026-11-16-codex-optional-titles.md)。
+
 停留在尚未连接的 Codex CLI 聊天页时，后台会继续读取终端追加的保存历史，不必为了查看新回复先点击“继续会话”。本机与 SSH 的刷新节奏不同，不承诺即时或固定延迟。模型标签按原生回合或保存记录显示；缺少证据时不猜测。后台只读刷新短暂超时不会直接丢弃仍有效的执行连接，真正断开或身份核验失败仍会使连接失效。
 
 ## 平台与运行要求
@@ -58,4 +60,4 @@ Open **SSH diagnostics** in Settings to read local and remote status and counts,
 
 Local CLI access is available on macOS, Windows and Linux; SSH hosts use their own installed and configured CLI. Windows history and cold resume recognize equivalent extended paths without relaxing file boundaries. Confirmed exited legacy Claude writers can be resumed; active or unverifiable writers remain protected. Linux Claude Code CLI support does not add Claude Desktop automatic connection.
 
-For new Codex chats, choose App or CLI and select a known local/SSH CLI project folder. CLI creation sends no initial message. Passive reading continues to follow saved history appended by a terminal without claiming its writer; local and SSH refresh cadence differs. Per-turn model labels require native or saved evidence, and transient read timeouts do not discard a still-valid execution connection.
+For new Codex chats, choose App or CLI and select a known local/SSH CLI project folder. CLI creation sends no initial message. Names are optional and blank by default; only an explicit name calls `thread/name/set`. The interface uses the native name, then the native preview, then “Unnamed chat”, and follows native name updates. Bridge does not create temporary naming sessions, send extra model requests, or store automatic-naming receipts. Passive reading continues to follow saved history appended by a terminal without claiming its writer; local and SSH refresh cadence differs. Per-turn model labels require native or saved evidence, and transient read timeouts do not discard a still-valid execution connection.

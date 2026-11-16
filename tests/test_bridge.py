@@ -1180,6 +1180,9 @@ class HttpTests(unittest.TestCase):
         target.register_project.assert_called_once_with('~/fixture', True, identifier)
         self.assertEqual(self.request('POST', path, body, headers)[0], 200)
         target.create_chat.assert_called_once_with(body['project'], body['title'], body['id'])
+        unnamed = {key: value for key, value in body.items() if key != 'title'}
+        self.assertEqual(self.request('POST', path, unnamed, headers)[0], 200)
+        target.create_chat.assert_called_with(body['project'], None, body['id'])
         self.assertEqual(self.request('POST', '/api/codex/entries', {'action': 'connect', 'id': identifier}, headers)[0], 200)
         target.connect.assert_called_once_with()
         manager.require_enabled.side_effect = ValueError('Application disabled')
@@ -1915,6 +1918,9 @@ class HttpTests(unittest.TestCase):
         self.assertEqual(status,200)
         self.assertEqual(result['id'],THREAD)
         self.assertEqual(calls,[(body['project'],body['title'],body['id'])])
+        unnamed = {key: value for key, value in body.items() if key != 'title'}
+        self.assertEqual(self.request('POST', '/api/sessions', unnamed, headers)[0], 200)
+        self.assertEqual(calls[-1], (body['project'], None, body['id']))
 
     def test_selected_project_host_is_forwarded_only_after_authentication(self):
         calls = []

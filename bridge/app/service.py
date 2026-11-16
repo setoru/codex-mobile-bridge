@@ -903,14 +903,14 @@ class Bridge:
     @operation(project='project_key')
     def create_chat(self, project_key, title, request_id, kind='desktop', model_options=None):
         from bridge.features.sessions.creation_models import intent
+        from bridge.features.sessions.create import normalize_creation_title
         model_options = model_options or {}
         if self.host.startswith('codex:'):
             kind = 'cli'
         if not isinstance(request_id, str):
             raise ValueError('创建请求标识无效')
         uuid.UUID(request_id)
-        if not isinstance(title, str) or not title.strip() or len(title) > 120:
-            raise ValueError('请输入 1–120 字的聊天名称')
+        title = normalize_creation_title(title)
         if kind not in ('desktop', 'cli'):
             raise ValueError('未知聊天类型')
         available = [project for project in self.projects(host=self.project_host(project_key))
@@ -920,7 +920,6 @@ class Bridge:
             project = {'host': self.host, 'cwd': None}
         if project is None:
             raise ValueError('请选择电脑 App 中已保存的项目')
-        title = title.strip()
         with self.create_lock:
             entry = self.creations.get(request_id)
             if entry:

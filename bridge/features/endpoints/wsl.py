@@ -73,6 +73,8 @@ class Session:
         self.action_lock = threading.RLock()
         self.timeline = Timeline()
         self.sequence = 0
+        self.name_revision = 0
+        self.name_generation = None
         self.state = {'id': identifier, 'turns': [], 'threadRuntimeStatus': {'type': 'notLoaded'}}
         self.connected = False
         self.activating = False
@@ -209,7 +211,18 @@ class WslEntry(WslFeatures):
         with self.lock:
             self.notification_dirty.add(session.id)
         with session.condition:
-            if 'id' in message:
+            if generation != self.generation:
+                return
+            if method == 'thread/name/updated':
+                name = params.get('threadName')
+                if (not session.connected or self.server is None or self.server.closed or
+                        name is not None and not isinstance(name, str)):
+                    return
+                session.name_revision += 1
+                session.name_generation = generation
+                session.state['threadName'] = name
+                session.state['title'] = name or session.state.get('threadPreview') or '未命名聊天'
+            elif 'id' in message:
                 if normalize_request(message).get('supported'):
                     request = {**copy.deepcopy(message), '_generation': generation}
                     session.state.setdefault('requests', []).append(request)
@@ -249,6 +262,8 @@ class WslEntry(WslFeatures):
 
     def _refresh(self, session):
         with session.action_lock:
+            with session.condition:
+                starting_name_revision = session.name_revision
             metadata = self.store.get(session.id)
             try:
                 runtime = self.runtime()
@@ -264,7 +279,8 @@ class WslEntry(WslFeatures):
                     if not cursor:
                         break
                 turns.reverse()
-                state = {'id': session.id, 'title': thread.get('name') or metadata.get('name') or metadata.get('display_title') or metadata.get('title'),
+                state = {'id': session.id, 'title': thread.get('name') or thread.get('preview') or '未命名聊天',
+                         'threadName': thread.get('name'), 'threadPreview': thread.get('preview'),
                          'cwd': thread.get('cwd'), 'latestModel': thread.get('model') or session.state.get('latestModel'),
                          'latestReasoningEffort': thread.get('reasoningEffort') or session.state.get('latestReasoningEffort'), 'modelProvider': thread.get('modelProvider'),
                          'threadRuntimeStatus': thread.get('status') or {},
@@ -276,9 +292,15 @@ class WslEntry(WslFeatures):
                     raise IPCError('WSL 原连接已变化')
             except IPCError as exc:
                 state = self.store.history(session.id, turn_limit=session.history_limit)
+                state['threadName'] = metadata.get('name')
+                state['threadPreview'] = metadata.get('title') or state.get('title')
                 state['title'] = metadata.get('display_title') or state.get('title')
                 connected, error = False, str(exc)
             with session.condition:
+                if (session.name_revision != starting_name_revision and
+                        session.name_generation == self.generation):
+                    state['threadName'] = session.state.get('threadName')
+                    state['title'] = state['threadName'] or state.get('threadPreview') or '未命名聊天'
                 requests = session.state.get('requests', [])
                 stamp = hashlib.sha256(json.dumps([state, connected, error], sort_keys=True).encode()).hexdigest()
                 for key in ('turnPlan', 'latestCollaborationMode', 'latestTokenUsageInfo'):
@@ -812,16 +834,15 @@ class WslEntry(WslFeatures):
     @_entry_write
     def create_chat(self, project_key, title, request_id, model_options=None):
         from bridge.features.sessions.creation_models import intent
+        from bridge.features.sessions.create import normalize_creation_title
         model_options = model_options or {}
         if not isinstance(request_id, str):
             raise ValueError('创建请求标识无效')
         uuid.UUID(request_id)
-        if not isinstance(title, str) or not 1 <= len(title.strip()) <= 120:
-            raise ValueError('请输入 1–120 字的聊天名称')
+        title = normalize_creation_title(title)
         if not isinstance(project_key, str) or not project_key.startswith(self.host + '|'):
             raise ValueError('请选择此 WSL 应用的已有项目或独立聊天')
         independent = project_key == self.host + '|independent'
-        title = title.strip()
         with self.create_lock:
             receipt = self.creations.get(request_id)
             if receipt:
@@ -870,7 +891,8 @@ class WslEntry(WslFeatures):
                     if model_options and (started.get('model') != model_options['model'] or
                             'effort' in model_options and started.get('reasoningEffort') != model_options['effort']):
                         raise IPCError('新聊天已创建，但模型或思考强度未确认；请检查原会话')
-                    runtime.request('thread/name/set', {'threadId': identifier, 'name': title})
+                    if title:
+                        runtime.request('thread/name/set', {'threadId': identifier, 'name': title})
                     # Force durable empty-thread history before exposing it in lists.
                     runtime.request('thread/read', {'threadId': identifier, 'includeTurns': True})
                 except Exception:
