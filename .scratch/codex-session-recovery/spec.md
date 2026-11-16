@@ -1,6 +1,6 @@
 # Codex 会话菜单：从会话恢复（App / CLI）
 
-Status: ready-for-agent
+Status: implemented
 Type: feature
 Created: 2026-11-16
 
