@@ -13,6 +13,7 @@ from unittest.mock import patch
 
 from bridge.app.service import Bridge
 from bridge.clients.codex.ipc import IPCError
+import test_session_recovery as fixtures
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -90,6 +91,8 @@ class RecoveryDesktopOwner:
 
 
 class DesktopRecoveryTests(unittest.TestCase):
+    recovery_body = fixtures.SessionRecoveryTests.recovery_body
+
     def setUp(self):
         temporary = tempfile.TemporaryDirectory(dir=ROOT / '.tmp')
         self.addCleanup(temporary.cleanup)
@@ -178,7 +181,7 @@ Path(log).write_text(json.dumps(calls))
     def test_unknown_owner_settings_are_read_back_without_repeating_writes(self):
         self.owner.fail_settings = True
         operation = str(uuid.uuid4())
-        result = self.bridge.recover(self.source, {'id': operation})
+        result = self.bridge.recover(self.source, self.recovery_body(operation))
         self.assertEqual(result['status'], 'unknown', result)
         self.assertEqual(result['id'], self.target)
         self.assertEqual(self.sent, [])
@@ -188,7 +191,7 @@ Path(log).write_text(json.dumps(calls))
         self.assertEqual(recovered['status'], 'not_submitted', recovered)
         self.assertEqual(self.sent, [])
         self.assertEqual([method for method, _ in self.owner.calls], ['thread-follower-update-thread-settings'])
-        confirmed = self.bridge.recover(self.source, {'id': operation})
+        confirmed = self.bridge.recover(self.source, self.recovery_body(operation))
         self.assertEqual(confirmed['status'], 'confirmed', confirmed)
         self.assertEqual(self.sent[0][:3], (self.target, 'source-model', 'high'))
         self.assertEqual(self.sent[0][3][0]['text'],
@@ -198,12 +201,12 @@ Path(log).write_text(json.dumps(calls))
     def test_unavailable_app_keeps_created_id_for_explicit_continuation(self):
         self.owner.available = False
         operation = str(uuid.uuid4())
-        result = self.bridge.recover(self.source, {'id': operation})
+        result = self.bridge.recover(self.source, self.recovery_body(operation))
         self.assertEqual(result['status'], 'not_submitted', result)
         self.assertEqual(result['id'], self.target)
         self.assertEqual(self.sent, [])
         self.owner.available = True
-        result = self.bridge.recover(self.source, {'id': operation})
+        result = self.bridge.recover(self.source, self.recovery_body(operation))
         self.assertEqual((result['status'], result['id']), ('confirmed', self.target), result)
         methods = [row['method'] for row in json.loads(self.log.read_text())]
         self.assertEqual(methods.count('thread/start'), 1)
@@ -211,14 +214,14 @@ Path(log).write_text(json.dumps(calls))
 
     def test_completed_receipt_does_not_override_later_native_model_changes(self):
         operation = str(uuid.uuid4())
-        result = self.bridge.recover(self.source, {'id': operation})
+        result = self.bridge.recover(self.source, self.recovery_body(operation))
         self.assertEqual(result['status'], 'confirmed', result)
         state = self.owner.states[self.target]
         state['latestModel'] = 'later-user-model'
         state['latestThreadSettings']['model'] = 'later-user-model'
         self.owner.publish(self.target)
         previous_calls = copy.deepcopy(self.owner.calls)
-        for duplicate in (self.bridge.recover(self.source, {'id': operation}),
+        for duplicate in (self.bridge.recover(self.source, self.recovery_body(operation)),
                           self.bridge.recover(self.source, request_id=operation)):
             self.assertEqual((duplicate['status'], duplicate['id']), ('confirmed', self.target))
         self.assertEqual(self.owner.states[self.target]['latestModel'], 'later-user-model')
@@ -254,7 +257,7 @@ Path(log).write_text(json.dumps(calls))
             self.assertEqual(process.returncode, 0, stderr)
             return json.loads(stdout)
         with patch('bridge.app.service.ssh_read', side_effect=ssh_read):
-            result = self.bridge.recover(self.source, {'id': str(uuid.uuid4())})
+            result = self.bridge.recover(self.source, self.recovery_body())
         self.assertEqual((result['status'], result['host'], result['id']),
                          ('confirmed', host, self.target), result)
         self.assertGreaterEqual(len(requests), 2)

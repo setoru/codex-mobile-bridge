@@ -688,11 +688,21 @@ class Bridge:
 
     def recover(self, thread_id, body=None, *, request_id=None):
         if body is None:
-            return self.recovery_commands.read(thread_id, request_id, self._recovery_reconcile)
-        if not isinstance(body, dict) or set(body) != {'id'} or not isinstance(body['id'], str):
+            result = self.recovery_commands.read(thread_id, request_id, self._recovery_reconcile)
+            if result['status'] == 'idle':
+                metadata = self.store.get(thread_id)
+                if metadata.get('origin') not in ('desktop', 'cli'):
+                    raise ValueError('此会话来源暂不支持从会话恢复')
+                environment = self._recovery_environment(metadata.get('model_provider'), metadata.get('cwd'))
+                result['sourceContext'] = self._recovery_context(thread_id, metadata, environment)
+            return result
+        if (not isinstance(body, dict) or set(body) != {'id', 'sourceContext'} or
+                not isinstance(body['id'], str) or not isinstance(body['sourceContext'], str) or
+                not re.fullmatch(r'[0-9a-f]{64}', body['sourceContext'])):
             raise ValueError('从会话恢复请求无效')
         return self.recovery_commands.perform(thread_id, body['id'],
-            prepare=lambda: self._recovery_source(thread_id), create=self._recovery_create,
+            source_context=body['sourceContext'],
+            prepare=lambda: self._recovery_source(thread_id, body['sourceContext']), create=self._recovery_create,
             configure=self._recovery_configure,
             send=lambda entry: self.send(entry['id'], entry['text'], entry['operationId'], _recovery=entry),
             receipt=self._recovery_receipt, execute=self._run_recovery)
@@ -703,11 +713,16 @@ class Bridge:
         # repeat clicks cannot queue behind the original operation's writes.
         return run()
 
+    def _recovery_context(self, thread_id, metadata, environment):
+        return draft_identity('recovery-source-v1', thread_id, self.host, self.native_host,
+                              metadata['origin'], metadata.get('model_provider'), metadata.get('cwd'),
+                              json.dumps(environment, sort_keys=True, separators=(',', ':')))
+
     def _recovery_environment(self, provider, cwd, expected=None):
         if self.local:
             result = {'directory': project_directory(cwd, expected=expected),
                       'home': str(self.codex_home.resolve()),
-                      'account': codex_account_identity(self.codex_home, provider, os.environ)}
+                      'account': codex_account_identity(self.codex_home, provider, shared_auth=True)}
             alias = None
         else:
             alias = self.hosts.hosts().get(self.host, {}).get('alias')
@@ -717,7 +732,7 @@ class Bridge:
             source += '\nrequest = ' + payload({'cwd': cwd, 'expected': expected, 'provider': provider}) + '\n'
             source += ('home = Path(os.environ.get("CODEX_HOME", str(Path.home()/".codex"))).resolve()\n'
                        'print(json.dumps({"directory": project_directory(request["cwd"], expected=request["expected"]), '
-                       '"home": str(home), "account": codex_account_identity(home, request["provider"], os.environ)}))\n')
+                       '"home": str(home), "account": codex_account_identity(home, request["provider"], shared_auth=True)}))\n')
             result = ssh_read(alias, source)
             if self.cli_sessions.remote_home is not None and str(self.cli_sessions.remote_home) != result['home']:
                 raise ValueError('原 SSH Codex 配置目录已变化')
@@ -726,12 +741,14 @@ class Bridge:
         return {'directoryIdentity': result['directory'],
                 'identity': {'home': result['home'], 'account': result['account'], 'host': self.host, 'alias': alias}}
 
-    def _recovery_source(self, thread_id):
+    def _recovery_source(self, thread_id, source_context):
         from bridge.features.sessions.create import creation_settings, verify_creation_settings
         metadata = self.store.get(thread_id)
         if metadata.get('origin') not in ('desktop', 'cli'):
             raise ValueError('此会话来源暂不支持从会话恢复')
         environment = self._recovery_environment(metadata.get('model_provider'), metadata.get('cwd'))
+        if self._recovery_context(thread_id, metadata, environment) != source_context:
+            raise ValueError('源会话接入或账号已变化，请重新打开会话菜单')
         session = self.session(thread_id, attach=False)
         with session.condition:
             state = copy.deepcopy(session.state) if session.connected else None
@@ -796,7 +813,7 @@ def created(identifier):
 try:
     home = Path(os.environ.get('CODEX_HOME', str(Path.home()/'.codex'))).resolve()
     expected = request['identity']
-    if str(home) != expected['home'] or codex_account_identity(home, request['settings']['modelProvider'], os.environ) != expected['account']:
+    if str(home) != expected['home'] or codex_account_identity(home, request['settings']['modelProvider'], shared_auth=True) != expected['account']:
         raise ValueError('原 SSH 接入或账号已变化，未创建新会话')
     project_directory(request['cwd'], expected=request['directoryIdentity'])
     runtime = shutil.which('codex') or str(Path.home()/'.local/bin/codex')

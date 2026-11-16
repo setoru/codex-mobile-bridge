@@ -89,9 +89,18 @@ class SessionRecoveryTests(unittest.TestCase):
                 'persistedUserMessageIds': thread.get('acceptedIds', []),
                 'threadRuntimeStatus': {'type': 'notLoaded'}}
 
+    def recovery_body(self, operation_id=None, bridge=None):
+        bridge = bridge or self.bridge
+        identifier = operation_id or str(uuid.uuid4())
+        contexts = self.__dict__.setdefault('_recovery_contexts', {})
+        key = (bridge.host, identifier)
+        if key not in contexts:
+            contexts[key] = bridge.recover(self.source, request_id=operation_id)['sourceContext']
+        return {'id': identifier, 'sourceContext': contexts[key]}
+
     def test_cli_recovery_creates_in_source_worktree_and_sends_with_source_settings(self):
         original = copy.deepcopy(self.native.threads[self.source])
-        result = self.bridge.recover(self.source, {'id': str(uuid.uuid4())})
+        result = self.bridge.recover(self.source, self.recovery_body())
         self.assertEqual(result['status'], 'confirmed', result)
         self.assertNotEqual(result['id'], self.source)
         target = self.native.threads[result['id']]
@@ -109,12 +118,12 @@ class SessionRecoveryTests(unittest.TestCase):
     def test_unknown_send_is_only_reconciled_from_fresh_receipts_without_replay(self):
         operation = str(uuid.uuid4())
         self.native.fail_send = True
-        result = self.bridge.recover(self.source, {'id': operation})
+        result = self.bridge.recover(self.source, self.recovery_body(operation))
         self.assertEqual(result['status'], 'unknown', result)
         self.assertIsNotNone(result['id'])
         self.native.fail_send = False
         for request in (operation, str(uuid.uuid4())):
-            duplicate = self.bridge.recover(self.source, {'id': request})
+            duplicate = self.bridge.recover(self.source, self.recovery_body(request))
             self.assertEqual((duplicate['id'], duplicate['operationId'], duplicate['status']),
                              (result['id'], operation, 'unknown'))
         self.native.threads[result['id']]['acceptedIds'] = [operation]
@@ -140,12 +149,22 @@ class SessionRecoveryTests(unittest.TestCase):
             return json.loads(subprocess.check_output([sys.executable, '-B', '-c', source],
                               env={**os.environ, 'CODEX_HOME': str(self.home)}, text=True))
         with patch('bridge.app.service.ssh_read', side_effect=ssh):
-            result = bridge.recover(self.source, {'id': str(uuid.uuid4())})
+            result = bridge.recover(self.source, self.recovery_body(bridge=bridge))
         self.assertEqual(result['status'], 'confirmed', result)
         self.assertEqual(result['host'], 'ssh-fixture')
         self.assertIn('?hostId=ssh-fixture)，继续完成', result['text'])
         self.assertTrue(calls)
         self.assertEqual(self.native.threads[result['id']]['cwd'], str(self.cwd))
+
+    def test_bridge_managed_api_account_uses_its_shared_native_authentication(self):
+        self.native.threads[self.source]['modelProvider'] = 'bridge_api'
+        (self.home / 'config.toml').write_text(
+            'model_provider = "bridge_api"\n[model_providers.bridge_api]\n'
+            'base_url = "https://fixture.invalid/v1"\nrequires_openai_auth = true\n')
+        (self.home / 'auth.json').write_text(json.dumps({'auth_mode': 'apikey', 'OPENAI_API_KEY': 'fixture-key'}))
+        result = self.bridge.recover(self.source, self.recovery_body())
+        self.assertEqual(result['status'], 'confirmed', result)
+        self.assertEqual(self.native.threads[result['id']]['modelProvider'], 'bridge_api')
 
 
 if __name__ == '__main__':

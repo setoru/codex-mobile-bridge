@@ -31,6 +31,8 @@ Claude Desktop Code 若提示需要信任工作区，请在电脑的 Claude Desk
 
 若新会话已创建但消息明确尚未发送，页面保留待发文本，可选择 **继续恢复** 或 **继续发送**，仍使用同一个新会话。若提示结果尚未确认，先选择 **核对结果**；已知新会话 ID 时也可选择 **打开新会话** 检查。核对不会自动重复创建或发送。无法确认源配置、目录或账号身份时会说明原因，不自动改用默认配置。
 
+菜单打开后若外部切换了账号或接入，需要重新打开菜单。恢复支持 Bridge 管理的 API 账号和官方账号兼容配置；原运行环境中的认证 Key 或 API 地址无法核验时，操作会停止并提示核对接入。
+
 ## English
 
 Select **New** in Web or mobile, choose a runtime environment, then select an existing project or **Choose directory**. The directory picker also offers a collapsed **New folder** action. A directory does not need an existing chat. Creating a folder does not initialize Git or overwrite files.
@@ -44,6 +46,8 @@ Browsing does not create a chat or send a message. Codex App and DSH use **Creat
 If Claude Desktop Code requires workspace trust, open the selected folder in Desktop Code, explicitly approve trust, and return to retry. The selected folder, chat title and first message remain in the dialog. The bridge never grants trust automatically. A timeout or disconnect remains an uncertain submission: inspect the original environment before retrying.
 
 Creation uses the original environment's permissions and account. Existing chats, project settings and connections are not migrated.
+
+Use **Continue in a new chat** directly below **Chat details** in a Codex App or CLI chat menu. It creates a new chat in the source connection and working directory, confirms supported model, reasoning, speed and permission settings, and sends the fixed Chinese reference message automatically. The source chat is retained. A known unsent message can continue in the same new chat; an uncertain result is checked without repeating creation or sending. Reopen the menu after an external account or connection change. Recovery stops if the original environment's authentication key or API route cannot be verified.
 
 ### Continue in a new chat
 

@@ -367,6 +367,28 @@ def creation_settings(settings=None, model=None, effort=None):
     return result
 
 
+def thread_service_tier(state, default=None):
+    """Read the native latest tier, preserving an explicitly cleared setting."""
+    latest = state.get('latestThreadSettings') or {}
+    if 'serviceTier' in latest:
+        return latest['serviceTier']
+    if 'serviceTier' in state:
+        return state['serviceTier']
+    history = state.get('turnHistory') or {}
+    turns = state.get('turns') or []
+    if history.get('kind') == 'canonical':
+        history = history.get('history') or {}
+        entities = history.get('entitiesByKey') or {}
+        turns, seen = [], set()
+        for island in history.get('islands') or []:
+            for entry in island.get('entries') or []:
+                key = entry.get('value')
+                if key in entities and key not in seen:
+                    seen.add(key)
+                    turns.append(entities[key])
+    return (turns[-1].get('params') or {}).get('serviceTier', default) if turns else default
+
+
 def verify_creation_settings(result, settings, cwd=None, *, local_windows=False):
     """Confirm native creation or owner state without guessing absent fields."""
     missing = object()
@@ -381,7 +403,7 @@ def verify_creation_settings(result, settings, cwd=None, *, local_windows=False)
         'modelProvider': actual.get('modelProvider', missing),
         'model': actual.get('latestModel', actual.get('model', latest.get('model', missing))),
         'reasoningEffort': actual.get('latestReasoningEffort', actual.get('reasoningEffort', latest.get('effort', missing))),
-        'serviceTier': latest.get('serviceTier', actual.get('serviceTier', missing)),
+        'serviceTier': thread_service_tier(actual, missing),
     }
     for key in ('approvalPolicy', 'approvalsReviewer', 'runtimeWorkspaceRoots'):
         values[key] = permissions.get(key, actual.get(key, missing))

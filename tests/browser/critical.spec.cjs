@@ -857,16 +857,17 @@ test('cached new-chat choices survive catalog verification', async ({page}) => {
 });
 
 for(const source of ['desktop','cli'])test('Codex '+source+' recovery menu preserves pending results and opens the created chat',async({page},testInfo)=>{
- const created='aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee',requests=[];
+ const created='aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee',requests=[],sourceContext='a'.repeat(64);
  let operationId,phase='settings',status='idle',release;
  await page.route('**/api/sessions/*/recover?**',async route=>{
   const request=route.request(),url=new URL(request.url());requests.push({method:request.method(),path:url.pathname,body:request.postDataJSON(),id:url.searchParams.get('id')});
   if(request.method()==='POST'){
    const body=request.postDataJSON();
+   expect(body.sourceContext).toBe(sourceContext);
    if(!operationId){operationId=body.id;status='running';await new Promise(resolve=>{release=resolve;});status=source==='desktop'?'unknown':'not_submitted';phase='sending';}
    else{expect(body.id).toBe(operationId);status='confirmed';phase='complete';}
   }
-  await route.fulfill({json:{operationId:operationId||null,status,phase,id:operationId?created:null,host:'local',
+  await route.fulfill({json:{operationId:operationId||null,status,phase,id:operationId?created:null,host:'local',sourceContext,
    message:status==='unknown'?'发送结果待核对':status==='not_submitted'?'消息尚未发送':'',
    ...(status==='not_submitted'?{text:'读取会话[合成来源](codex://threads/source)，继续完成'}:{})}});
  });
@@ -904,15 +905,15 @@ for(const source of ['desktop','cli'])test('Codex '+source+' recovery menu prese
 });
 
 test('a recovery request missing from the server is continued explicitly with the saved identity',async({page})=>{
- const created='aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee',writes=[];let accept=false;
+ const created='aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee',writes=[],sourceContext='a'.repeat(64);let accept=false,currentSource=sourceContext;
  await page.route('**/api/sessions/*/recover?**',async route=>{
   const request=route.request();
   if(request.method()==='POST'){
    const body=request.postDataJSON();writes.push(body);
-   if(!accept)return route.abort('failed');
-   return route.fulfill({json:{operationId:body.id,status:'confirmed',phase:'complete',id:created,host:'local'}});
+   if(!accept){currentSource='b'.repeat(64);return route.abort('failed');}
+   return route.fulfill({json:{operationId:body.id,status:'confirmed',phase:'complete',id:created,host:'local',sourceContext}});
   }
-  return route.fulfill({json:{operationId:null,status:'idle',id:null,host:'local'}});
+  return route.fulfill({json:{operationId:null,status:'idle',id:null,host:'local',sourceContext:currentSource}});
  });
  await ready(page,'session-menu');await expect(page.locator('#login')).toBeHidden();
  await page.evaluate(async()=>{
@@ -931,6 +932,26 @@ test('a recovery request missing from the server is continued explicitly with th
  await expect(menu.getByRole('button',{name:'继续恢复',exact:true})).toBeVisible();expect(writes).toHaveLength(1);
  accept=true;await menu.getByRole('button',{name:'继续恢复',exact:true}).click();
  await expect(menu).toBeHidden();expect(writes).toHaveLength(2);expect(writes[1].id).toBe(writes[0].id);
+ expect(writes.map(body=>body.sourceContext)).toEqual([sourceContext,sourceContext]);
  expect(await page.evaluate(()=>window.__recoveryNavigation.opened)).toEqual([{id:created,host:'local'}]);
  await page.evaluate(()=>{openChat=window.__recoveryNavigation.openChat;loadList=window.__recoveryNavigation.loadList;delete window.__recoveryNavigation;});
+});
+
+test('recovery captures the source when opening its menu before an external account change',async({page})=>{
+ const sourceContext='a'.repeat(64),requests=[];let changed=false;
+ await page.route('**/api/sessions/*/recover?**',async route=>{
+  const request=route.request(),body=request.postDataJSON();requests.push({method:request.method(),body});
+  return route.fulfill({json:body?{operationId:body.id,status:'failed',phase:'validating',id:null,host:'local',sourceContext,
+   message:'原接入或账号已变化，尚未创建新会话'}:{operationId:null,status:'idle',id:null,host:'local',sourceContext:changed?'b'.repeat(64):sourceContext}});
+ });
+ await ready(page,'session-menu');await expect(page.locator('#login')).toBeHidden();
+ await page.evaluate(async()=>{await BridgeFeatures.load('chat');BridgeI18n.setLanguage('zh');});
+ const row=page.locator('#sessions .session').first(),menu=page.locator('dialog.session-menu');
+ await row.focus();await page.keyboard.press('Shift+F10');
+ await expect(menu).toBeVisible();await expect.poll(()=>requests.length).toBe(1);
+ expect(requests[0].method).toBe('GET');changed=true;
+ await menu.getByRole('button',{name:'从会话恢复',exact:true}).click();
+ await expect(menu.getByRole('alert')).toHaveText('原接入或账号已变化，尚未创建新会话');
+ expect(requests).toHaveLength(2);expect(requests[1].body.sourceContext).toBe(sourceContext);
+ await menu.getByRole('button',{name:'返回会话菜单',exact:true}).click();
 });

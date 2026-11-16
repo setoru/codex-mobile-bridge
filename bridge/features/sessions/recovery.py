@@ -3,6 +3,7 @@ import copy
 import re
 import uuid
 from urllib.parse import quote
+from bridge.features.sessions.create import thread_service_tier
 
 
 def recovery_settings(state):
@@ -14,8 +15,10 @@ def recovery_settings(state):
     effort = latest.get('effort', state.get('latestReasoningEffort'))
     if effort is not None:
         settings['config'] = {'model_reasoning_effort': effort}
-    if 'serviceTier' in latest:
-        settings['serviceTier'] = latest['serviceTier']
+    missing = object()
+    tier = thread_service_tier(state, missing)
+    if tier is not missing:
+        settings['serviceTier'] = tier
     permissions = {**(state.get('currentPermissions') or {}), **latest}
     profile = permissions.get('activePermissionProfile') or {}
     permission = profile.get('id')
@@ -66,7 +69,7 @@ class RecoveryCommands:
         if entry is None:
             return {'operationId': None, 'status': 'idle', 'id': None, 'host': self.host}
         return {key: copy.deepcopy(entry.get(key)) for key in
-                ('operationId', 'status', 'phase', 'id', 'host', 'message', 'text')}
+                ('operationId', 'status', 'phase', 'id', 'host', 'message', 'text', 'sourceContext')}
 
     def _find(self, source_id, request_id):
         if request_id:
@@ -94,18 +97,21 @@ class RecoveryCommands:
         with self.lock:
             return self._public(entry)
 
-    def perform(self, source_id, request_id, *, prepare, create, configure, send, receipt, execute):
+    def perform(self, source_id, request_id, *, source_context, prepare, create, configure, send, receipt, execute):
         uuid.UUID(source_id)
         uuid.UUID(request_id)
         with self.lock:
             entry = self._find(source_id, request_id)
             if entry is None:
                 entry = self._find(source_id, None)
+            if entry is not None and entry.get('sourceContext') != source_context:
+                raise ValueError('同一恢复操作不能使用不同的源接入或账号身份')
             if entry is not None and (entry['operationId'] in self.active or
                                       entry['status'] in ('confirmed', 'unknown', 'failed')):
                 return self._public(entry)
             if entry is None:
                 entry = {'recoverySource': source_id, 'operationId': request_id, 'id': None,
+                         'sourceContext': source_context,
                          'host': self.host, 'status': 'running', 'phase': 'validating',
                          'message': '正在读取源会话设置…', 'title': '', 'project': None}
                 self.entries[request_id] = entry

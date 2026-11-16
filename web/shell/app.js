@@ -411,33 +411,54 @@ function sessionMenuContext(chat,provider='codex'){
   if(provider==='codex'&&['desktop','cli'].includes(access.source)){
     const recoveryEntry=selectedCodexEntry,recoveryAccount=codexActiveAccountId;
     const recoveryCurrent=()=>isCurrent()&&selectedCodexEntry===recoveryEntry&&codexActiveAccountId===recoveryAccount;
+    const url=sessionUrl(chat.id,'recover',identity.host),key='session-recovery:'+JSON.stringify([scope,identity.host,chat.id]);
+    const validSource=value=>typeof value==='string'&&/^[0-9a-f]{64}$/.test(value);
+    const stored=()=>{
+      let value;try{value=sessionStorage.getItem(key);}catch{return {};}
+      if(!value)return {};
+      try{const record=JSON.parse(value);return record&&typeof record.id==='string'?record:{};}
+      catch{return {id:value};}
+    };
+    let {id:operationId,sourceContext}=stored();
+    const save=()=>sessionStorage.setItem(key,JSON.stringify({id:operationId,...(validSource(sourceContext)?{sourceContext}:{})}));
+    const read=async()=>{
+      const requested=operationId;
+      const result=await api(url+(requested?(url.includes('?')?'&':'?')+'id='+encodeURIComponent(requested):''),undefined,undefined,recoveryCurrent);
+      if(!sourceContext&&validSource(result.sourceContext)&&(!requested||result.operationId===requested))sourceContext=result.sourceContext;
+      return requested&&result.status==='idle'?{...result,sourceContext:validSource(sourceContext)?sourceContext:null,operationId:requested,status:validSource(sourceContext)?'not_submitted':'unknown',phase:'creating',
+        message:validSource(sourceContext)?'尚未找到此次恢复记录，可继续恢复':'恢复结果尚未确认，请核对后再继续'}:result;
+    };
+    const remember=result=>{
+      if(result.operationId){
+        const previous=operationId;
+        if(previous&&previous!==result.operationId)sourceContext=validSource(result.sourceContext)?result.sourceContext:undefined;
+        else if(!sourceContext&&validSource(result.sourceContext))sourceContext=result.sourceContext;
+        operationId=result.operationId;
+        if(!previous||stored().id===previous)save();
+      }
+      return result;
+    };
+    // Capture the source while opening the menu; a later click must not pick
+    // up an account that changed outside this page in the meantime.
+    let opening=read().then(result=>({result}),error=>({error}));
     context.recover=async(report=()=>{},{mode='start',isVisible=()=>true}={})=>{
       if(!recoveryCurrent())throw Error('连接或账号已变化，请重新打开会话菜单');
       const navigation=JSON.stringify([clientNavigation.provider,currentId,currentHost,chatOpenGeneration]);
       const canNavigate=()=>recoveryCurrent()&&isVisible()&&navigation===JSON.stringify([clientNavigation.provider,currentId,currentHost,chatOpenGeneration]);
-      const url=sessionUrl(chat.id,'recover',identity.host),key='session-recovery:'+JSON.stringify([scope,identity.host,chat.id]);
-      let operationId=sessionStorage.getItem(key);
-      const read=async()=>{
-        const requested=operationId;
-        const result=await api(url+(requested?(url.includes('?')?'&':'?')+'id='+encodeURIComponent(requested):''),undefined,undefined,recoveryCurrent);
-        return requested&&result.status==='idle'?{...result,operationId:requested,status:'not_submitted',phase:'creating',message:'尚未找到此次恢复记录，可继续恢复'}:result;
-      };
-      const remember=result=>{
-        if(result.operationId){
-          if(!operationId||sessionStorage.getItem(key)===operationId)sessionStorage.setItem(key,result.operationId);
-          operationId=result.operationId;
-        }
-        return result;
-      };
-      let result=await read();
+      const captured=opening;opening=null;
+      const initial=captured?await captured:{result:await read()};
+      if(initial.error)throw initial.error;
+      let result=initial.result;
       if(!recoveryCurrent())throw Error('连接或账号已变化，请重新打开会话菜单');
       const fresh=mode==='start'&&!operationId&&['idle','confirmed','failed'].includes(result.status)||mode==='retry'&&result.status==='failed'&&!result.id;
+      const submitting=fresh||mode==='continue'&&result.status==='not_submitted';
+      if(submitting&&!validSource(sourceContext))throw Error('尚未确认原接入身份，请重新打开会话菜单');
       if(fresh){
-        operationId=uuid();sessionStorage.setItem(key,operationId);
+        operationId=uuid();save();
       }else if(result.operationId){
-        operationId=result.operationId;sessionStorage.setItem(key,operationId);
+        remember(result);
       }
-      if(fresh||mode==='continue'&&result.status==='not_submitted'){
+      if(submitting){
         report({operationId,status:'running',phase:fresh?'creating':result.phase});
         let submitting=true,timer;
         const poll=async()=>{
@@ -447,7 +468,7 @@ function sessionMenuContext(chat,provider='codex'){
           finally{if(submitting&&recoveryCurrent()&&isVisible())timer=setTimeout(poll,1000);}
         };
         timer=setTimeout(poll,500);
-        try{result=await api(url,{id:operationId},undefined,recoveryCurrent);}
+        try{result=await api(url,{id:operationId,sourceContext},undefined,recoveryCurrent);}
         catch(error){
           if(!recoveryCurrent())throw error;
           try{result=await read();}catch{result={...result,status:'unknown'};}
@@ -465,7 +486,7 @@ function sessionMenuContext(chat,provider='codex'){
       }
       report(result);
       if(result.status==='confirmed'){
-        if(sessionStorage.getItem(key)===operationId)sessionStorage.removeItem(key);
+        if(stored().id===operationId)sessionStorage.removeItem(key);
         if(recoveryCurrent()){
           await loadList(true);
           if(canNavigate())await openChat(result.id,result.host);

@@ -2,6 +2,7 @@
 const test=require('node:test'),assert=require('node:assert/strict'),fs=require('node:fs'),vm=require('node:vm'),path=require('node:path');
 const source=fs.readFileSync(path.join(__dirname,'../web/shell/app.js'),'utf8');
 const code=source.slice(source.indexOf('function renderList(){'),source.indexOf('async function loadList('));
+const sourceContext='a'.repeat(64);
 function fixture(){
  const nodes=new Map(),timers=new Map(),requests=[],dialogs=[],copies=[],opened=[],notices=[],storage=new Map();let timer=0;
  const node=(tag='',cls='',textContent='')=>({tag,cls,textContent,dataset:{},classList:{add(){}},children:[],events:{},scrollTop:0,isConnected:true,append(...items){this.children.push(...items);},replaceChildren(...items){this.children=items;},addEventListener(name,run){this.events[name]=run;},setAttribute(){},focus(){this.focused=true;},showModal(){this.open=true;},close(){this.open=false;this.events.close?.();},remove(){this.isConnected=false;}});
@@ -12,7 +13,7 @@ function fixture(){
    renderActivity(){},sessionAccess:v=>({source:'desktop',canConfigure:true,canEditMessages:true,...v}),sourceLabel:()=> 'APP',dateText:()=>'',toast:text=>notices.push(text),pinRow:row=>row,sessionPins:{value:(_identity,pinned)=>!!pinned,set(identity,pinned){requests.push({url:`/${identity.host}/${identity.id}/pin`,body:{pinned}});}},desktopSessions:{refresh:async()=>{}},openChat:async(id,host)=>opened.push({id,host}),
    sessionStorage:{getItem:key=>storage.get(key)??null,setItem:(key,value)=>storage.set(key,value),removeItem:key=>storage.delete(key)},
    setTimeout:fn=>{timers.set(++timer,fn);return timer;},clearTimeout:id=>timers.delete(id),uuid:()=> 'request-id',
-   api:async(url,body)=>{requests.push({url,body});return {status:'confirmed'};},sessionUrl:(id,action,host)=>`/${host}/${id}/${action}`,loadList:async()=>{}});
+   api:async(url,body)=>{requests.push({url,body});return {status:'confirmed',sourceContext};},sessionUrl:(id,action,host)=>`/${host}/${id}/${action}`,loadList:async()=>{}});
  context.ClientIdentity=require('../web/features/clients/client-lifecycle.js').ClientIdentity;context.URLSearchParams=URLSearchParams;
  vm.runInContext(code,context);
  const row=(id,recency,pinned=false)=>({id,host:'local',title:id,projectKey:'p',projectName:'Project',hostLabel:'Local',recency,bridgePinned:pinned,access:{}});
@@ -23,16 +24,17 @@ test('recovery creates and sends from the captured source then opens the returne
  ui.context.currentId='another-chat';
  ui.context.api=async(url,body)=>{
   ui.requests.push({url,body});
-  return body?{operationId:body.id,status:'confirmed',phase:'complete',id:'created',host:'remote'}:{status:'idle',operationId:null,id:null,host:'remote'};
+  return body?{operationId:body.id,status:'confirmed',phase:'complete',id:'created',host:'remote'}:{status:'idle',operationId:null,id:null,host:'remote',sourceContext};
  };
  const context=ui.context.sessionMenuContext(chat),progress=[];
  assert.equal(typeof context.recover,'function');
- assert.equal(ui.requests.length,0);
+ assert.equal(ui.requests.length,1);
  const result=await context.recover(value=>progress.push(value));
  assert.equal(result.status,'confirmed');
  assert.deepEqual(ui.requests.map(row=>row.url),['/remote/source/recover','/remote/source/recover']);
  assert.equal(ui.requests[1].body.id,'request-id');
- assert.deepEqual(Object.keys(ui.requests[1].body),['id']);
+ assert.deepEqual(Object.keys(ui.requests[1].body),['id','sourceContext']);
+ assert.equal(ui.requests[1].body.sourceContext,sourceContext);
  assert.deepEqual(ui.opened,[{id:'created',host:'remote'}]);
  assert.equal(progress.at(-1).status,'confirmed');
  assert.equal([...ui.storage.keys()].filter(key=>key.startsWith('session-recovery:')).length,0);
@@ -41,7 +43,7 @@ test('recovery preserves newer navigation and rejects a changed account before d
  const ui=fixture(),chat=ui.row('source',1);let finish;
  ui.context.api=async(url,body)=>{
   ui.requests.push({url,body});
-  return body?new Promise(resolve=>{finish=resolve;}):{status:'idle',operationId:null};
+  return body?new Promise(resolve=>{finish=resolve;}):{status:'idle',operationId:null,sourceContext};
  };
  const menu=ui.context.sessionMenuContext(chat),pending=menu.recover();
  await new Promise(resolve=>setImmediate(resolve));
@@ -50,10 +52,10 @@ test('recovery preserves newer navigation and rejects a changed account before d
  await pending;assert.deepEqual(ui.opened,[]);
  const stale=ui.context.sessionMenuContext(chat);ui.context.codexActiveAccountId='new-account';
  await assert.rejects(()=>stale.recover(),/连接或账号/);
- assert.equal(ui.requests.length,2);
+ assert.equal(ui.requests.length,3);
 });
 test('reopening an unsent recovery retains its text and only an explicit continue submits the same operation',async()=>{
- const ui=fixture(),chat=ui.row('source',1),saved={status:'not_submitted',phase:'sending',operationId:'previous',id:'created',host:'local',text:'读取会话[示例](codex://threads/source)，继续完成'};
+ const ui=fixture(),chat=ui.row('source',1),saved={status:'not_submitted',phase:'sending',operationId:'previous',id:'created',host:'local',sourceContext,text:'读取会话[示例](codex://threads/source)，继续完成'};
  ui.context.api=async(url,body)=>{
   ui.requests.push({url,body});return body?{...saved,status:'confirmed',phase:'complete'}:saved;
  };
@@ -66,11 +68,11 @@ test('reopening an unsent recovery retains its text and only an explicit continu
  assert.deepEqual(ui.opened,[{id:'created',host:'local'}]);
 });
 test('lost recovery responses are reconciled by reads and unknown sends are never resubmitted',async()=>{
- const ui=fixture(),chat=ui.row('source',1),unknown={operationId:'request-id',status:'unknown',phase:'sending',id:'created',host:'local',message:'结果待核对'};
+ const ui=fixture(),chat=ui.row('source',1),unknown={operationId:'request-id',status:'unknown',phase:'sending',id:'created',host:'local',sourceContext,message:'结果待核对'};
  ui.context.api=async(url,body)=>{
   ui.requests.push({url,body});
   if(body)throw Error('network interrupted');
-  return url.includes('id=')?unknown:{status:'idle',operationId:null};
+  return url.includes('id=')?unknown:{status:'idle',operationId:null,sourceContext};
  };
  const result=await ui.context.sessionMenuContext(chat).recover();
  assert.equal(result.status,'unknown');assert.equal(result.id,'created');
@@ -80,14 +82,14 @@ test('lost recovery responses are reconciled by reads and unknown sends are neve
  assert.deepEqual(ui.opened,[]);
 });
 test('a stored recovery with no server record can only be explicitly continued using its original ID',async()=>{
- const ui=fixture(),chat=ui.row('source',1);let accept=false;
+ const ui=fixture(),chat=ui.row('source',1);let accept=false,currentSource=sourceContext;
  ui.context.api=async(url,body)=>{
   ui.requests.push({url,body});
   if(body){
-   if(!accept)throw Error('request did not reach the server');
+   if(!accept){currentSource='b'.repeat(64);throw Error('request did not reach the server');}
    return {status:'confirmed',phase:'complete',operationId:body.id,id:'created',host:'local'};
   }
-  return {status:'idle',operationId:null,id:null,host:'local'};
+  return {status:'idle',operationId:null,id:null,host:'local',sourceContext:currentSource};
  };
  const interrupted=await ui.context.sessionMenuContext(chat).recover();
  assert.equal(interrupted.status,'not_submitted');assert.equal(interrupted.phase,'creating');assert.equal(interrupted.operationId,'request-id');
@@ -97,14 +99,45 @@ test('a stored recovery with no server record can only be explicitly continued u
  accept=true;await reopened.recover(()=>{},{mode:'continue'});
  const writes=ui.requests.filter(row=>row.body);
  assert.equal(writes.length,2);assert.equal(writes[0].body.id,writes[1].body.id);
+ assert.equal(writes[0].body.sourceContext,sourceContext);assert.equal(writes[1].body.sourceContext,sourceContext);
  assert.deepEqual(ui.opened,[{id:'created',host:'local'}]);
+});
+test('recovery refuses a missing or invalid menu source identity before writing',async()=>{
+ for(const captured of [undefined,null,'a'.repeat(63),'b'.repeat(65),'A'.repeat(64)]){
+  const ui=fixture(),chat=ui.row('source',1);
+  ui.context.api=async(url,body)=>{ui.requests.push({url,body});return {status:'idle',operationId:null,sourceContext:captured};};
+  await assert.rejects(()=>ui.context.sessionMenuContext(chat).recover(),/尚未确认原接入身份/);
+  assert.equal(ui.requests.filter(row=>row.body).length,0);
+ }
+});
+test('unavailable recovery storage keeps the menu usable and prevents an unrecorded submission',async()=>{
+ const ui=fixture(),chat=ui.row('source',1);
+ ui.context.sessionStorage.getItem=()=>{throw Error('Storage unavailable');};
+ ui.context.sessionStorage.setItem=()=>{throw Error('Storage unavailable');};
+ let menu;assert.doesNotThrow(()=>{menu=ui.context.sessionMenuContext(chat);});
+ assert.equal(typeof menu.organization,'function');
+ await assert.rejects(()=>menu.recover(),/Storage unavailable/);
+ assert.equal(ui.requests.filter(row=>row.body).length,0);
+});
+test('a legacy pending recovery without a server record cannot acquire a different source identity',async()=>{
+ const ui=fixture(),chat=ui.row('source',1);
+ ui.storage.set('session-recovery:'+JSON.stringify(['gateway','local','source']),'legacy-operation');
+ ui.context.api=async(url,body)=>{
+  ui.requests.push({url,body});
+  return {status:'idle',operationId:null,sourceContext:'b'.repeat(64)};
+ };
+ const first=await ui.context.sessionMenuContext(chat).recover();
+ assert.equal(first.status,'unknown');
+ const reopened=await ui.context.sessionMenuContext(chat).recover(()=>{},{mode:'continue'});
+ assert.equal(reopened.status,'unknown');
+ assert.equal(ui.requests.filter(row=>row.body).length,0);
 });
 test('a pending recovery reports server progress while the original write remains in flight',async()=>{
  const ui=fixture(),chat=ui.row('source',1),progress=[];let finish;
  ui.context.api=async(url,body)=>{
   ui.requests.push({url,body});
   if(body)return new Promise(resolve=>{finish=resolve;});
-  return url.includes('id=')?{status:'running',phase:'settings',operationId:'request-id',id:'created',host:'local'}:{status:'idle',operationId:null};
+  return url.includes('id=')?{status:'running',phase:'settings',operationId:'request-id',id:'created',host:'local',sourceContext}:{status:'idle',operationId:null,sourceContext};
  };
  const pending=ui.context.sessionMenuContext(chat).recover(value=>progress.push(value));
  await new Promise(resolve=>setImmediate(resolve));ui.fireTimers();await new Promise(resolve=>setImmediate(resolve));
@@ -126,7 +159,7 @@ test('reopening a running recovery follows it with reads until completion',async
  const ui=fixture(),chat=ui.row('source',1);let reads=0;
  ui.context.api=async(url,body)=>{
   ui.requests.push({url,body});reads++;
-  return {status:reads===1?'running':'confirmed',phase:reads===1?'sending':'complete',operationId:'existing',id:'created',host:'local'};
+  return {status:reads===1?'running':'confirmed',phase:reads===1?'sending':'complete',operationId:'existing',id:'created',host:'local',sourceContext};
  };
  const pending=ui.context.sessionMenuContext(chat).recover();
  await new Promise(resolve=>setImmediate(resolve));ui.fireTimers();
@@ -141,7 +174,7 @@ test('a rejected recovery can be explicitly retried with a new operation after i
  ui.context.api=async(url,body)=>{
   ui.requests.push({url,body});
   if(body){writes++;lastOperation=body.id;return {operationId:body.id,status:writes===1?'failed':'confirmed',phase:writes===1?'validating':'complete',id:writes===1?null:'created',host:'local',message:'原目录不存在'};}
-  return writes?{operationId:lastOperation,status:'failed',phase:'validating',id:null,host:'local'}:{status:'idle',operationId:null};
+  return writes?{operationId:lastOperation,status:'failed',phase:'validating',id:null,host:'local',sourceContext}:{status:'idle',operationId:null,sourceContext};
  };
  const menu=ui.context.sessionMenuContext(chat);
  assert.equal((await menu.recover()).status,'failed');
@@ -152,9 +185,9 @@ test('a recovery deduplicated by the server follows the returned operation ident
  const ui=fixture(),chat=ui.row('source',1);
  ui.context.api=async(url,body)=>{
   ui.requests.push({url,body});
-  if(body)return {status:'running',phase:'sending',operationId:'other-device',id:'created',host:'local'};
-  if(url.includes('id='))return {status:'confirmed',phase:'complete',operationId:'other-device',id:'created',host:'local'};
-  return {status:'idle',operationId:null};
+  if(body)return {status:'running',phase:'sending',operationId:'other-device',id:'created',host:'local',sourceContext};
+  if(url.includes('id='))return {status:'confirmed',phase:'complete',operationId:'other-device',id:'created',host:'local',sourceContext};
+  return {status:'idle',operationId:null,sourceContext};
  };
  const pending=ui.context.sessionMenuContext(chat).recover();
  await new Promise(resolve=>setImmediate(resolve));ui.fireTimers();await pending;
@@ -169,7 +202,7 @@ test('native organization preserves host and expected assignment and rejects sta
  assert.equal(ui.requests.at(-1).body.expectedId,'project-a');
  ui.context.csrf='replacement';
  await assert.rejects(()=>context.organization(),/连接或账号/);
- assert.equal(ui.requests.length,1);
+ assert.equal(ui.requests.filter(row=>row.body).length,1);
 });
 test('recent sections sort pinned and unpinned independently; project grouping ignores pins',()=>{
  const ui=fixture();ui.context.listRows=[ui.row('recent',30),ui.row('old-pin',1,true),ui.row('new-pin',20,true),ui.row('older',2)];
@@ -182,9 +215,10 @@ test('shared context preserves original host for pin, rename and archive',async(
  const ui=fixture(),chat={...ui.row('a',1),host:'remote'};
  const menu=ui.context.sessionMenuContext(chat);
  await menu.pin(true);await menu.rename('New');await menu.archive();
- assert.equal(ui.requests[0].url,'/remote/a/pin');assert.equal(ui.requests[0].body.pinned,true);
- assert.equal(ui.requests[1].url,'/remote/a/rename');assert.equal(ui.requests[1].body.title,'New');
- assert.equal(ui.requests[2].url,'/remote/a/archive');assert.equal(ui.requests[2].body.disconnect,true);
+ const writes=ui.requests.filter(row=>row.body);
+ assert.equal(writes[0].url,'/remote/a/pin');assert.equal(writes[0].body.pinned,true);
+ assert.equal(writes[1].url,'/remote/a/rename');assert.equal(writes[1].body.title,'New');
+ assert.equal(writes[2].url,'/remote/a/archive');assert.equal(writes[2].body.disconnect,true);
  assert.equal(menu.nativeOrganization,true);
 });
 test('project groups put unassigned hosts last and preserve activity order within each group',()=>{
@@ -251,7 +285,8 @@ test('opaque provider IDs and archive capability stay isolated',async()=>{
 });
 test('restoring an archived session never requests disconnect',async()=>{
  const ui=fixture();await ui.context.sessionMenuContext({...ui.row('a',1),archived:true}).archive();
- assert.equal(ui.requests[0].body.archived,false);assert.equal(ui.requests[0].body.disconnect,undefined);
+ const write=ui.requests.find(row=>row.body);
+ assert.equal(write.body.archived,false);assert.equal(write.body.disconnect,undefined);
 });
 test('account change invalidates a captured menu; read-only sources omit rename and fork',()=>{
  const ui=fixture(),menu=ui.context.sessionMenuContext(ui.row('a',1));assert.equal(menu.isCurrent(),true);
@@ -273,7 +308,9 @@ for(const [provider,runtime] of [['codex','desktop'],['codex','cli'],['claude','
    ui.context.desktopSessions={provider,sid:chat.id,state:null,notifications:()=>{notified++;}};
   }
   const menu=ui.context.sessionMenuContext(chat,provider);
-  assert.equal(ui.requests.length,0,'opening the menu does not activate or write');
+  assert.equal(ui.requests.filter(row=>row.body).length,0,'opening the menu does not write');
+  assert.equal(ui.opened.length,0,'opening the menu does not activate chats');
+  assert.ok(ui.requests.every(row=>row.url.endsWith('/recover')),'opening only reads the recovery context');
   assert.equal(menu.nativeOrganization,true);assert.equal(menu.organizationScope,provider==='codex'?'native':'bridge');assert.equal(typeof menu.rename,'function');
   assert.equal(typeof menu.pin,'function');assert.equal(typeof menu.fork,'function');assert.equal(typeof menu.archive,'function');
   await menu.notifications();assert.equal(notified,1);
