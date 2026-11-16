@@ -25,6 +25,12 @@ Claude Desktop Code 若提示需要信任工作区，请在电脑的 Claude Desk
 
 目录权限使用原运行环境的权限；创建失败不会自动切换用户、账号或执行环境。选择项目不迁移已有会话，也不修改原项目配置。
 
+## 从会话恢复
+
+在会话列表右键或长按一个 Codex App／CLI 会话，在“会话详情”下选择 **从会话恢复**。系统沿用原接入、主机、实际工作目录及可核验的模型、思考强度、速度和权限设置，新建空会话后自动发送 `读取会话[源会话标题](codex://threads/源会话ID)，继续完成`。支持本机与已登记的 SSH 接入；远端链接保留原主机信息。新会话创建并发送成功后自动打开，源会话保留，名称由 Codex 正常生成。
+
+若新会话已创建但消息明确尚未发送，页面保留待发文本，可选择 **继续恢复** 或 **继续发送**，仍使用同一个新会话。若提示结果尚未确认，先选择 **核对结果**；已知新会话 ID 时也可选择 **打开新会话** 检查。核对不会自动重复创建或发送。无法确认源配置、目录或账号身份时会说明原因，不自动改用默认配置。
+
 ## English
 
 Select **New** in Web or mobile, choose a runtime environment, then select an existing project or **Choose directory**. The directory picker also offers a collapsed **New folder** action. A directory does not need an existing chat. Creating a folder does not initialize Git or overwrite files.
@@ -38,3 +44,9 @@ Browsing does not create a chat or send a message. Codex App and DSH use **Creat
 If Claude Desktop Code requires workspace trust, open the selected folder in Desktop Code, explicitly approve trust, and return to retry. The selected folder, chat title and first message remain in the dialog. The bridge never grants trust automatically. A timeout or disconnect remains an uncertain submission: inspect the original environment before retrying.
 
 Creation uses the original environment's permissions and account. Existing chats, project settings and connections are not migrated.
+
+### Continue in a new chat
+
+Right-click or long-press a Codex App or CLI conversation and select **Continue in a new chat** below **Chat details**. The action keeps its connection, host, actual working directory and verifiable model, reasoning, speed and permission settings, then creates an empty conversation and sends `读取会话[Source title](codex://threads/SourceID)，继续完成`. The message remains in Chinese. Local and registered SSH connections are supported; remote links retain the original host. The new conversation opens after successful submission, keeps native automatic naming, and leaves the source conversation intact.
+
+If the new conversation exists and the message is known to be unsent, the pending text remains available with **Continue recovery** or **Continue sending**, using the same new conversation. For an unconfirmed result, select **Check result** or **Open new chat** when its ID is known. Checking never automatically repeats creation or sending. Unverifiable source settings, directories or account identity produce an explanation instead of silently selecting defaults.

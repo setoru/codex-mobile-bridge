@@ -206,13 +206,13 @@ class CliSessions:
         """Fail closed on unknown native status before a local account change."""
         return self.daemon_status() != 'stopped'
 
-    def create(self, cwd, title='', on_start=None, on_created=None, model=None, effort=None):
+    def create(self, cwd, title='', on_start=None, on_created=None, model=None, effort=None, *, settings=None):
         """An explicit new CLI chat; no turn is started."""
         if not isinstance(cwd, str) or not cwd or (self.alias is None and not Path(cwd).is_dir()):
             raise AppServerUnavailable('CLI 项目目录不存在')
-        from bridge.features.sessions.create import model_overrides, normalize_creation_title
+        from bridge.features.sessions.create import creation_settings, normalize_creation_title, verify_creation_settings
         title = normalize_creation_title(title)
-        overrides = model_overrides(model, effort)
+        overrides = creation_settings(settings, model, effort)
         info = self._connect_explicit()
         if self.alias is None and Path(info['codexHome']) != self.home:
             raise AppServerUnavailable('Codex CLI runtime belongs to another home')
@@ -221,31 +221,45 @@ class CliSessions:
             if not remote_home.is_absolute() or (self.remote_home is not None and remote_home != self.remote_home):
                 raise AppServerUnavailable('Remote Codex CLI runtime identity changed')
             self.remote_home = remote_home
+        params = {'cwd': cwd, 'ephemeral': False, 'threadSource': 'cli', **overrides}
+        process = self.client.process
         if on_start is not None:
             on_start()
-        params = {'cwd': cwd, 'ephemeral': False, 'threadSource': 'cli', **overrides}
         result = self.client.request('thread/start', params)
         thread = result.get('thread') or {}
         thread_id = thread.get('id')
-        if not isinstance(thread_id, str) or not same_cwd(cwd, thread.get('cwd'), self.alias is None and os.name == 'nt') or not thread.get('modelProvider'):
+        if not isinstance(thread_id, str):
             raise AppServerUnsupported('CLI creation returned an unverified thread')
         uuid.UUID(thread_id)
-        if on_created is not None:
-            on_created(thread_id)
-        if model is not None and (result.get('model') != model or effort is not None and result.get('reasoningEffort') != effort):
-            raise AppServerUnsupported('新聊天已创建，但模型或思考强度未确认；请检查原会话，不要重复创建')
-        with self.lock:
-            self.joined[thread_id] = self.client.process
-            self.metadata[thread_id] = {'connectionToken': str(uuid.uuid4()), 'cwd': cwd, 'modelProvider': thread['modelProvider'],
-                                        'model': result.get('model'), 'reasoningEffort': result.get('reasoningEffort'),
-                                        'serviceTier': result.get('serviceTier'),
-                                        'collaborationMode': result.get('collaborationMode'),
-                                        'permissions': {key: copy.deepcopy(result[key]) for key in
-                                                        ('approvalPolicy', 'approvalsReviewer', 'sandbox', 'activePermissionProfile')
-                                                        if key in result}, 'goal': None}
-        if title:
-            self.client.request('thread/name/set', {'threadId': thread_id, 'name': title})
-        return self.refresh(thread_id)
+        try:
+            if on_created is not None:
+                on_created(thread_id)
+            if process is None or self.client.process is not process:
+                raise AppServerUnavailable('CLI connection changed during creation')
+            if not same_cwd(cwd, thread.get('cwd'), self.alias is None and os.name == 'nt') or not thread.get('modelProvider'):
+                raise AppServerUnsupported('CLI creation returned an unverified thread')
+            if settings is not None:
+                verify_creation_settings(result, overrides)
+            if model is not None and (result.get('model') != model or effort is not None and result.get('reasoningEffort') != effort):
+                raise AppServerUnsupported('新聊天已创建，但模型或思考强度未确认；请检查原会话，不要重复创建')
+            with self.lock:
+                self.joined[thread_id] = self.client.process
+                self.metadata[thread_id] = {'connectionToken': str(uuid.uuid4()), 'cwd': cwd, 'modelProvider': thread['modelProvider'],
+                                            'model': result.get('model'), 'reasoningEffort': result.get('reasoningEffort'),
+                                            **({'serviceTier': result['serviceTier']} if 'serviceTier' in result else {}),
+                                            'collaborationMode': result.get('collaborationMode'),
+                                            'permissions': {key: copy.deepcopy(result[key]) for key in
+                                                            ('approvalPolicy', 'approvalsReviewer', 'sandbox', 'activePermissionProfile', 'runtimeWorkspaceRoots')
+                                                            if key in result}, 'goal': None}
+            if title:
+                self.client.request('thread/name/set', {'threadId': thread_id, 'name': title})
+            state = self.refresh(thread_id)
+            if settings is not None:
+                verify_creation_settings(state, overrides)
+            return state
+        except Exception as exc:
+            exc.created_id = thread_id
+            raise
 
     def archive_call(self, thread_id, archived, identifiers, disconnect=False, check_scope=None):
         # Explicit archive may start the installed original daemon, never a thread.
@@ -437,10 +451,10 @@ class CliSessions:
                                         'modelProvider': resumed.get('modelProvider'),
                                         'cwd': resumed.get('cwd'),
                                         'reasoningEffort': resumed.get('reasoningEffort'),
-                                        'serviceTier': resumed.get('serviceTier'),
+                                        **({'serviceTier': resumed['serviceTier']} if 'serviceTier' in resumed else {}),
                                         'collaborationMode': resumed.get('collaborationMode'),
                                         'permissions': {key: copy.deepcopy(resumed[key]) for key in
-                                                        ('approvalPolicy', 'approvalsReviewer', 'sandbox', 'activePermissionProfile')
+                                                        ('approvalPolicy', 'approvalsReviewer', 'sandbox', 'activePermissionProfile', 'runtimeWorkspaceRoots')
                                                         if key in resumed},
                                         'goal': goal}
         try:
@@ -951,7 +965,7 @@ class CliSessions:
                 'latestReasoningEffort': (thread['reasoningEffort'] if 'reasoningEffort' in thread
                                           else metadata.get('reasoningEffort')),
                 'threadRuntimeStatus': status, 'turns': turns, 'requests': requests}
-        if metadata.get('serviceTier') is not None:
+        if 'serviceTier' in metadata:
             state['latestThreadSettings'] = {'serviceTier': metadata['serviceTier']}
         if metadata.get('permissions'):
             permissions = copy.deepcopy(metadata['permissions'])

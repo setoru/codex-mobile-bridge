@@ -9,12 +9,12 @@ UUID = r'[0-9a-f-]{36}'
 DIAGNOSTIC_UUID = r'[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}'
 THREAD = re.compile(r'/api/sessions/' + UUID + r'(?:/(.*))?')
 DESKTOP = re.compile(r'/api/desktop-sessions/(?:deepseek|claude)/(.*)')
-READ = {'', 'catalog', 'poll', 'timeline', 'detail', 'changes', 'notifications',
+READ = {'', 'catalog', 'poll', 'timeline', 'detail', 'changes', 'notifications', 'recover',
         'side-chat', 'terminal', 'subagents', 'workspace', 'workspace/preview',
         'workspace/download', 'workspace/info', 'workspace/git-status', 'workspace/git-diff',
         'workspace/git-history', 'workspace/git-commit', 'workspace/git-history-diff',
         'workspace/git-branches'}
-WRITE = {'send', 'stop', 'history', 'respond', 'reconnect', 'queue', 'settings',
+WRITE = {'send', 'stop', 'history', 'respond', 'reconnect', 'recover', 'queue', 'settings',
          'permissions', 'uploads', 'message-action', 'rename', 'pin', 'archive', 'notifications',
          'goal/cancel', 'goal/edit', 'goal/status', 'side-chat', 'terminal',
          'workspace/upload', 'workspace/git-action'}

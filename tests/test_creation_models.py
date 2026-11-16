@@ -1,4 +1,7 @@
 import tempfile
+import json
+import subprocess
+import sys
 import unittest
 import uuid
 from pathlib import Path
@@ -10,6 +13,94 @@ from bridge.features.sessions.create import create_empty, CreationError
 from bridge.features.sessions.creation_models import validate
 from bridge.clients.codex.catalog import Catalog
 from bridge.app.service import Bridge
+
+
+class NativeRecoveryCreation(unittest.TestCase):
+    def setUp(self):
+        temporary_root = Path(__file__).resolve().parents[1] / '.tmp'
+        temporary_root.mkdir(exist_ok=True)
+        temporary = tempfile.TemporaryDirectory(dir=temporary_root)
+        self.addCleanup(temporary.cleanup)
+        self.root = Path(temporary.name)
+        self.identifier = '10000000-0000-4000-8000-000000000001'
+        self.settings = {
+            'modelProvider': 'source-provider', 'model': 'source-model',
+            'config': {'model_reasoning_effort': 'high'}, 'serviceTier': 'fast',
+            'permissions': ':workspace', 'approvalPolicy': 'on-request',
+            'approvalsReviewer': 'user', 'runtimeWorkspaceRoots': [str(self.root)]}
+        self.reply = {
+            'thread': {'id': self.identifier, 'cwd': str(self.root), 'modelProvider': 'source-provider'},
+            'model': 'source-model', 'reasoningEffort': 'high', 'serviceTier': 'fast',
+            'activePermissionProfile': {'id': ':workspace'}, 'approvalPolicy': 'on-request',
+            'approvalsReviewer': 'user', 'runtimeWorkspaceRoots': [str(self.root)]}
+        self.saved_thread = None
+        self.log = self.root / 'requests.json'
+        script = self.root / 'runtime.py'
+        script.write_text('''import json, sys
+from pathlib import Path
+responses = json.loads(Path(sys.argv[1]).read_text())
+reply = responses['start']
+calls = []
+for line in sys.stdin:
+    request = json.loads(line)
+    calls.append(request)
+    if 'id' not in request:
+        continue
+    result = reply if request['method'] == 'thread/start' else {'thread': responses['saved']} if request['method'] == 'thread/read' else {}
+    print(json.dumps({'id': request['id'], 'result': result}), flush=True)
+Path(sys.argv[2]).write_text(json.dumps(calls))
+''')
+        real_popen = subprocess.Popen
+        def start(argv, **kwargs):
+            self.assertEqual(argv, ['fixture-runtime', 'app-server', '--listen', 'stdio://'])
+            response = self.root / 'response.json'
+            response.write_text(json.dumps({'start': self.reply, 'saved': self.saved_thread or self.reply['thread']}))
+            return real_popen([sys.executable, str(script), str(response), str(self.log)], **kwargs)
+        patcher = patch('bridge.features.sessions.create.subprocess.Popen', side_effect=start)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def test_empty_creation_inherits_verified_source_settings_without_starting_a_turn(self):
+        created, started = [], []
+        result = create_empty('fixture-runtime', self.root, str(self.root), settings=self.settings,
+                              on_created=created.append, on_start=lambda: started.append(True))
+        self.assertEqual(result, self.identifier)
+        self.assertEqual(created, [self.identifier])
+        self.assertEqual(started, [True])
+        calls = json.loads(self.log.read_text())
+        self.assertEqual([call['method'] for call in calls],
+                         ['initialize', 'initialized', 'thread/start', 'thread/read'])
+        self.assertEqual(calls[2]['params'], {
+            'cwd': str(self.root), 'ephemeral': False,
+            'modelProvider': 'source-provider', 'model': 'source-model',
+            'config': {'model_reasoning_effort': 'high'}, 'serviceTier': 'fast',
+            'permissions': ':workspace', 'approvalPolicy': 'on-request',
+            'approvalsReviewer': 'user', 'runtimeWorkspaceRoots': [str(self.root)]})
+
+    def test_creation_keeps_new_id_when_saved_identity_does_not_match(self):
+        self.saved_thread = {**self.reply['thread'], 'cwd': str(self.root / 'different-worktree')}
+        created = []
+        with self.assertRaisesRegex(CreationError, '工作目录尚未确认') as caught:
+            create_empty('fixture-runtime', self.root, str(self.root), settings=self.settings,
+                         on_created=created.append)
+        self.assertEqual(created, [self.identifier])
+        self.assertEqual(caught.exception.created_id, self.identifier)
+        self.assertEqual([row['method'] for row in json.loads(self.log.read_text())],
+                         ['initialize', 'initialized', 'thread/start', 'thread/read'])
+
+    @unittest.skipIf(sys.platform == 'win32', 'POSIX source identity is literal')
+    def test_creation_does_not_resolve_a_different_posix_directory_spelling(self):
+        self.reply['thread']['cwd'] = str(self.root) + '/.'
+        with self.assertRaisesRegex(CreationError, '工作目录尚未确认'):
+            create_empty('fixture-runtime', self.root, str(self.root), settings=self.settings)
+
+    def test_creation_rejects_permission_profile_with_conflicting_effective_sandbox(self):
+        self.reply['sandbox'] = {'type': 'dangerFullAccess'}
+        created = []
+        with self.assertRaisesRegex(CreationError, '权限'):
+            create_empty('fixture-runtime', self.root, str(self.root), settings=self.settings,
+                         on_created=created.append)
+        self.assertEqual(created, [self.identifier])
 
 
 class CreationChoices(unittest.TestCase):

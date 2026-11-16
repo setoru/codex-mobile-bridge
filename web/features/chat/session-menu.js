@@ -127,7 +127,7 @@ class SessionMenu {
     box.addEventListener('click',event=>{if(box.classList.contains('sm-returning')){event.preventDefault();event.stopPropagation();}},true);
   }
   show(context,anchor){
-    this.close({immediate:true});this.context=context;this.anchor=anchor;this.busy=false;
+    this.close({immediate:true});this.context=context;this.anchor=anchor;this.busy=false;this.recovery=null;
     const box=this.node('dialog','session-menu');this.box=box;box.setAttribute('aria-label',this.t('会话菜单'));
     box.addEventListener('close',()=>{box.remove();if(this.box===box){this.box=null;if(anchor?.element?.isConnected)anchor.element.focus();}});
     box.addEventListener('cancel',event=>{event.preventDefault();this.back();});
@@ -162,6 +162,18 @@ class SessionMenu {
     catch(error){if(box.isConnected){const message=box.querySelector('.sm-error')||this.node('p','sm-error');message.setAttribute('role','alert');message.textContent=this.t(error.message);box.append(message);this.position();}else this.notify(this.t(error.message));}
     finally{if(this.box===box){this.busy=false;if(button?.isConnected)button.disabled=false;}}
   }
+  async recover(mode='start'){
+    if(this.busy)return;
+    const box=this.box,context=this.context,active=()=>this.box===box&&this.context===context;
+    this.busy=true;this.recovery={...this.recovery,status:'running',phase:'validating'};this.render('recovery');
+    box.querySelector('button')?.focus();
+    const report=result=>{if(active()){this.recovery=result;if(this.view==='recovery')this.render('recovery');}};
+    try{
+      this.valid();const result=await context.recover(report,{mode,isVisible:()=>active()&&this.view==='recovery'});
+      if(active()){if(result.status==='confirmed')this.close();else report(result);}
+    }catch(error){report({...this.recovery,status:'unknown',message:error.message});}
+    finally{if(active()){this.busy=false;if(this.view==='recovery')this.render('recovery');}}
+  }
   render(view='main'){
     const c=this.context,box=this.box;this.clearDrag?.();this.view=view;box.replaceChildren();box.append(this.node('div','sm-handle'));
     if(view!=='main')this.row('返回会话菜单','back',()=>this.back());
@@ -183,6 +195,18 @@ class SessionMenu {
       for(const [label,value,copy] of c.details||[]){if(value===undefined||value===null||value==='')continue;const line=this.node('div'),dd=this.node('dd','',String(value));line.append(this.node('dt','',this.t(label)),dd);
         if(copy){const button=this.node('button','sm-icon message-copy');button.type='button';button.setAttribute('aria-label',this.t('复制')+' '+this.t(label));button.append(this.icon('copy'));button.onclick=()=>this.copy(String(value),button);line.append(button);}details.append(line);}
       box.append(details);if(c.source)this.row('来源会话：'+c.source.title,'link',()=>{this.close();c.source.open();});
+    }else if(view==='recovery'){
+      const result=this.recovery||{},running=result.status==='running',complete=result.status==='confirmed';
+      const phases={validating:'正在读取会话设置…',creating:'正在创建…',settings:'正在确认会话设置…',sending:'正在发送…'};
+      box.append(this.node('h3','sm-heading',this.t('从会话恢复')));
+      const message=this.node('p',running||complete?'sm-explanation':'sm-error',this.t(running?(phases[result.phase]||'正在读取会话设置…'):complete?'新会话已创建并发送':result.message||'恢复结果尚未确认，请核对后再继续'));
+      message.setAttribute('role',running||complete?'status':'alert');box.append(message);
+      if(result.status==='not_submitted'){
+        if(result.text)box.append(this.node('p','sm-explanation',this.t('待发送消息')),this.node('p','sm-explanation',result.text));
+        this.row(result.phase==='sending'?'继续发送':'继续恢复','fork',()=>this.recover('continue'),{disabled:this.busy});
+      }else if(result.status==='failed')this.row('重试','fork',()=>this.recover('retry'),{disabled:this.busy});
+      else if(!this.busy)this.row('核对结果','info',()=>this.recover('check'));
+      if(result.id&&c.openRecovery)this.row('打开新会话','link',button=>this.execute(()=>c.openRecovery(result),button),{disabled:this.busy});
     }else if(view==='project'||view==='section'){
       box.append(this.node('h3','sm-heading',this.t(view==='project'?'项目':'分区')));
       this.loadOrganization(view,c,box);
@@ -208,6 +232,7 @@ class SessionMenu {
       if(c.cliNetwork)this.row('检查 CLI 网络','link',c.cliNetwork);
       if(c.releaseCli)this.row('释放 CLI 连接','link',()=>{this.close();c.releaseCli();});
       this.row('会话详情','info',()=>this.render('details'),{end:true});
+      if(c.recover)this.row('从会话恢复','fork',()=>this.recover());
       if(c.archive){this.separator();this.row(c.archived?'恢复会话':'停止任务并归档…','archive',button=>c.archived?this.execute(c.archive,button):this.render('archive'),{danger:!c.archived});}
       if(c.deletion)this.row('永久删除…','close',()=>this.render('delete'),{danger:true});
     }

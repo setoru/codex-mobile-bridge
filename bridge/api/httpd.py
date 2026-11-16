@@ -12,6 +12,7 @@ import socket
 import platform
 import threading
 import time
+import uuid
 from functools import lru_cache
 from http import HTTPStatus
 from http.cookies import SimpleCookie
@@ -63,7 +64,7 @@ def _prepared_static(data, content_type, use_gzip):
 from bridge.features.sessions.cli_release import CliConnections
 from bridge.app.lifecycle import private_json
 
-THREAD_ROUTE = re.compile(r"^/api/sessions/([0-9a-f-]{36})(?:/(events|send|stop|history|respond|reconnect|cli-network|queue|catalog|settings|permissions|poll|timeline|changes|detail|notifications|uploads|message-action|message-management|rename|pin|archive|delete|organization|compact))?$")
+THREAD_ROUTE = re.compile(r"^/api/sessions/([0-9a-f-]{36})(?:/(events|send|stop|history|respond|reconnect|recover|cli-network|queue|catalog|settings|permissions|poll|timeline|changes|detail|notifications|uploads|message-action|message-management|rename|pin|archive|delete|organization|compact))?$")
 UPLOAD_PREVIEW_ROUTE = re.compile(r"^/api/sessions/([0-9a-f-]{36})/uploads/([0-9a-f-]{36})/preview$")
 UPLOAD_THUMB_ROUTE = re.compile(r"^/api/sessions/([0-9a-f-]{36})/uploads/([0-9a-f-]{36})/thumb$")
 DESKTOP_IMAGE_ROUTE = re.compile(r"^/api/sessions/([0-9a-f-]{36})/desktop-images/([0-9a-f]{64})$")
@@ -1308,6 +1309,26 @@ class Handler(BaseHTTPRequestHandler):
             if not match:
                 return self.output(404, {"error": "页面不存在"})
             thread_id, action = match.groups()
+            if action == 'recover':
+                if not callable(getattr(bridge, 'recover', None)):
+                    raise ValueError('此接入暂不支持从会话恢复')
+                if write:
+                    body = self.read_json()
+                    if set(body) != {'id'} or not isinstance(body['id'], str):
+                        raise ValueError('从会话恢复请求无效')
+                    identifier = body['id']
+                else:
+                    identifiers = parse_qs(urlsplit(self.path).query, keep_blank_values=True).get('id', [])
+                    if len(identifiers) > 1:
+                        raise ValueError('从会话恢复请求无效')
+                    identifier = identifiers[0] if identifiers else None
+                if identifier is not None:
+                    try:
+                        uuid.UUID(identifier)
+                    except ValueError:
+                        raise ValueError('从会话恢复请求无效') from None
+                return self.output(200, bridge.recover(thread_id, body) if write else
+                                   bridge.recover(thread_id, request_id=identifier))
             if action == 'cli-network':
                 if not hasattr(bridge, 'cli_network'):
                     raise ValueError('只支持本机 Codex CLI')

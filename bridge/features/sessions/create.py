@@ -319,6 +319,97 @@ def model_overrides(model=None, effort=None):
     return {'model': model, **({'config': {'model_reasoning_effort': effort}} if effort is not None else {})}
 
 
+def creation_settings(settings=None, model=None, effort=None):
+    """Validate explicit source settings before an empty thread can be created."""
+    overrides = model_overrides(model, effort)
+    if settings is None:
+        return overrides
+    allowed = {'modelProvider', 'model', 'config', 'serviceTier', 'permissions',
+               'approvalPolicy', 'approvalsReviewer', 'runtimeWorkspaceRoots'}
+    if not isinstance(settings, dict) or set(settings) - allowed:
+        raise CreationUnavailable('原会话包含不支持的新建设置')
+    provider = settings.get('modelProvider')
+    if (not isinstance(provider, str) or not provider or len(provider) > 300 or
+            any(c.isspace() or ord(c) < 32 for c in provider)):
+        raise CreationUnavailable('尚未确认原会话的模型提供商')
+    config = settings.get('config', {})
+    if not isinstance(config, dict) or set(config) - {'model_reasoning_effort'}:
+        raise CreationUnavailable('原会话包含不支持的新建模型设置')
+    source_effort = config.get('model_reasoning_effort')
+    if 'model_reasoning_effort' in config and source_effort is None:
+        raise CreationUnavailable('尚未确认原会话的思考强度')
+    result = model_overrides(settings.get('model'), source_effort)
+    if not result or any(result.get(key) != value for key, value in overrides.items()):
+        raise CreationUnavailable('原会话模型设置与新建参数不一致')
+    result['modelProvider'] = provider
+    if 'serviceTier' in settings:
+        tier = settings['serviceTier']
+        if tier is not None and (not isinstance(tier, str) or not tier or len(tier) > 100 or
+                                 any(c.isspace() or ord(c) < 32 for c in tier)):
+            raise CreationUnavailable('原会话速度档位无效')
+        result['serviceTier'] = tier
+    permission_keys = {'permissions', 'approvalPolicy', 'approvalsReviewer'}
+    if set(settings) & permission_keys:
+        if (not permission_keys <= settings.keys() or
+                settings['permissions'] not in (':workspace', ':danger-full-access') or
+                settings['approvalPolicy'] not in ('on-request', 'never') or
+                settings['approvalsReviewer'] not in ('user', 'auto_review', 'guardian_subagent') or
+                (settings['permissions'] == ':danger-full-access') != (settings['approvalPolicy'] == 'never') or
+                (settings['permissions'] == ':danger-full-access' and settings['approvalsReviewer'] != 'user')):
+            raise CreationUnavailable('原会话权限设置尚不支持可靠继承')
+        result.update({key: settings[key] for key in permission_keys})
+    if 'runtimeWorkspaceRoots' in settings:
+        roots = settings['runtimeWorkspaceRoots']
+        if not isinstance(roots, list) or any(not isinstance(root, str) or not root or
+                                             any(ord(c) < 32 for c in root) for root in roots):
+            raise CreationUnavailable('原会话工作区权限目录无效')
+        result['runtimeWorkspaceRoots'] = list(roots)
+    return result
+
+
+def verify_creation_settings(result, settings, cwd=None, *, local_windows=False):
+    """Confirm native creation or owner state without guessing absent fields."""
+    missing = object()
+    thread = result.get('thread') or result
+    latest = thread.get('latestThreadSettings') or {}
+    permissions = {**(thread.get('currentPermissions') or {}), **latest}
+    actual = {**thread, **result}
+    expected = {key: value for key, value in settings.items() if key != 'config'}
+    if 'config' in settings:
+        expected['reasoningEffort'] = settings['config']['model_reasoning_effort']
+    values = {
+        'modelProvider': actual.get('modelProvider', missing),
+        'model': actual.get('latestModel', actual.get('model', latest.get('model', missing))),
+        'reasoningEffort': actual.get('latestReasoningEffort', actual.get('reasoningEffort', latest.get('effort', missing))),
+        'serviceTier': latest.get('serviceTier', actual.get('serviceTier', missing)),
+    }
+    for key in ('approvalPolicy', 'approvalsReviewer', 'runtimeWorkspaceRoots'):
+        values[key] = permissions.get(key, actual.get(key, missing))
+    profile = permissions.get('activePermissionProfile', actual.get('activePermissionProfile'))
+    values['permissions'] = permissions.get('permissions', actual.get('permissions',
+        profile.get('id', missing) if isinstance(profile, dict) else missing))
+    if any(values.get(key, missing) != value for key, value in expected.items()):
+        raise CreationError('新聊天已创建，但继承设置尚未确认；请检查新会话，不要重复创建')
+    if 'permissions' in expected:
+        policy = permissions.get('sandboxPolicy', actual.get('sandboxPolicy', actual.get('sandbox', missing)))
+        expected_types = {':workspace': ('workspaceWrite', 'workspace-write'),
+                          ':danger-full-access': ('dangerFullAccess', 'danger-full-access')}
+        if (isinstance(profile, dict) and profile.get('id') != expected['permissions'] or
+                policy is not missing and (not isinstance(policy, dict) or
+                    policy.get('type') not in expected_types.get(expected['permissions'], ()))):
+            raise CreationError('新聊天权限配置与实际沙箱不一致；请核对新会话，不要重复创建')
+    if cwd is not None:
+        actual_cwd = thread.get('cwd')
+        matches = isinstance(actual_cwd, str) and actual_cwd == cwd
+        if not matches and local_windows:
+            try:
+                matches = os.path.samefile(cwd, actual_cwd)
+            except (OSError, ValueError, TypeError):
+                pass
+        if not matches:
+            raise CreationError('新聊天已创建，但工作目录尚未确认；请检查新会话，不要重复创建')
+
+
 def normalize_creation_title(value):
     """An omitted name leaves the native thread available for automatic naming."""
     if value is None:
@@ -331,18 +422,28 @@ def normalize_creation_title(value):
     return value
 
 
-def create_empty(executable, codex_home, cwd, title='', project=None, model=None, effort=None):
+def create_empty(executable, codex_home, cwd, title='', project=None, model=None, effort=None, *,
+                 settings=None, on_created=None, on_start=None, isolated_home=False):
     title = normalize_creation_title(title)
-    overrides = model_overrides(model, effort)
+    overrides = creation_settings(settings, model, effort)
     supported = project is not None and _native_project_support(executable, project.get('required', False))
+    created_id = None
     def create(request):
+        nonlocal created_id
         project_id = _native_project(request, cwd, project) if supported else None
         params = {'cwd': cwd, 'ephemeral': False, **overrides}
         if project_id is not None:
             params['projectId'] = project_id
+        if on_start is not None:
+            on_start()
         result = request('thread/start', params)
         thread_id = result['thread']['id']
         uuid.UUID(thread_id)
+        created_id = thread_id
+        if on_created is not None:
+            on_created(thread_id)
+        if settings is not None:
+            verify_creation_settings(result, overrides, cwd, local_windows=os.name == 'nt')
         if model is not None and (result.get('model') != model or effort is not None and result.get('reasoningEffort') != effort):
             raise CreationError('聊天已创建，但模型或思考强度尚未确认，请检查原会话；不会重复创建')
         if project_id is not None and result['thread'].get('projectId') != project_id:
@@ -350,10 +451,21 @@ def create_empty(executable, codex_home, cwd, title='', project=None, model=None
         if title:
             request('thread/name/set', {'threadId': thread_id, 'name': title})
         saved = request('thread/read', {'threadId': thread_id, 'includeTurns': True})
+        if settings is not None:
+            if saved.get('thread', {}).get('id') != thread_id:
+                raise CreationError('新聊天已创建，但保存的会话身份尚未确认；请检查新会话，不要重复创建')
+            verify_creation_settings(saved, {'modelProvider': overrides['modelProvider']}, cwd,
+                                     local_windows=os.name == 'nt')
         if project_id is not None and saved['thread'].get('projectId') != project_id:
             raise CreationError('聊天已创建但项目归属未持久化确认，请检查电脑 App，不要重复创建')
         return thread_id
-    return _runtime_operation(executable, codex_home, cwd, create)
+    try:
+        return _runtime_operation(executable, codex_home, cwd, create,
+                                  **({'isolated_home': True} if isolated_home else {}))
+    except Exception as exc:
+        if created_id is not None:
+            exc.created_id = created_id
+        raise
 
 
 def fork_copy(executable, codex_home, cwd, source_id, turn_id, title, settings, *, thread_source=None, isolated_home=False):

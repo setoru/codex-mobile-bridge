@@ -87,6 +87,55 @@ class CliSessionTests(unittest.TestCase):
     def tearDown(self):
         self.temp.cleanup()
 
+    def test_cli_creation_inherits_source_settings_and_keeps_new_identity(self):
+        identifier = '20000000-0000-4000-8000-000000000002'
+        self.fake.thread.update(id=identifier, cwd=str(self.home), model='source-model',
+                                modelProvider='source-provider', reasoningEffort='high')
+        native_request = self.fake.request
+        def request(method, params, **kwargs):
+            if method == 'thread/start':
+                self.fake.sent.append((method, params))
+                return {'thread': self.fake.thread.copy(), 'model': 'source-model',
+                        'reasoningEffort': 'high', 'serviceTier': 'fast',
+                        'activePermissionProfile': {'id': ':workspace'}, 'approvalPolicy': 'on-request',
+                        'approvalsReviewer': 'user', 'runtimeWorkspaceRoots': [str(self.home)]}
+            return native_request(method, params, **kwargs)
+        self.fake.request = request
+        created = []
+        settings = {'modelProvider': 'source-provider', 'model': 'source-model',
+                    'config': {'model_reasoning_effort': 'high'}, 'serviceTier': 'fast',
+                    'permissions': ':workspace', 'approvalPolicy': 'on-request',
+                    'approvalsReviewer': 'user', 'runtimeWorkspaceRoots': [str(self.home)]}
+        state = self.sessions.create(str(self.home), settings=settings, on_created=created.append)
+        self.assertEqual(created, [identifier])
+        self.assertEqual(state['id'], identifier)
+        self.assertEqual(state['latestModel'], 'source-model')
+        self.assertEqual(state['latestReasoningEffort'], 'high')
+        self.assertEqual(state['latestThreadSettings']['serviceTier'], 'fast')
+        self.assertEqual(state['currentPermissions']['runtimeWorkspaceRoots'], [str(self.home)])
+        self.assertEqual([method for method, _ in self.fake.sent], ['thread/start', 'thread/read'])
+        self.assertEqual(self.fake.sent[0][1], {'cwd': str(self.home), 'ephemeral': False,
+                                              'threadSource': 'cli', **settings})
+
+    def test_cli_creation_retains_id_without_joining_a_changed_connection(self):
+        identifier = '20000000-0000-4000-8000-000000000003'
+        self.fake.thread.update(id=identifier, cwd=str(self.home))
+        native_request = self.fake.request
+        def request(method, params, **kwargs):
+            if method == 'thread/start':
+                self.fake.sent.append((method, params))
+                self.fake.process = object()
+                return {'thread': self.fake.thread.copy(), 'model': 'original-model'}
+            return native_request(method, params, **kwargs)
+        self.fake.request = request
+        created = []
+        with self.assertRaisesRegex(AppServerUnavailable, 'connection changed') as caught:
+            self.sessions.create(str(self.home), on_created=created.append,
+                                 settings={'modelProvider': 'original-provider', 'model': 'original-model'})
+        self.assertEqual(created, [identifier])
+        self.assertEqual(caught.exception.created_id, identifier)
+        self.assertEqual([method for method, _ in self.fake.sent], ['thread/start'])
+
     def test_passive_attach_does_not_connect_or_resume(self):
         self.sessions._start_daemon = Mock()
         Path(self.fake.socket_path).unlink()

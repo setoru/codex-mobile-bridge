@@ -855,3 +855,82 @@ test('cached new-chat choices survive catalog verification', async ({page}) => {
   await expect(model).toHaveValue('');expect(await page.evaluate(()=>window.__creationCacheRace.picker.valid())).toBe(false);
   await page.evaluate(()=>{window.__creationCacheRace.picker.dispose();window.__creationCacheRace.root.remove();delete window.__creationCacheRace;});
 });
+
+for(const source of ['desktop','cli'])test('Codex '+source+' recovery menu preserves pending results and opens the created chat',async({page},testInfo)=>{
+ const created='aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee',requests=[];
+ let operationId,phase='settings',status='idle',release;
+ await page.route('**/api/sessions/*/recover?**',async route=>{
+  const request=route.request(),url=new URL(request.url());requests.push({method:request.method(),path:url.pathname,body:request.postDataJSON(),id:url.searchParams.get('id')});
+  if(request.method()==='POST'){
+   const body=request.postDataJSON();
+   if(!operationId){operationId=body.id;status='running';await new Promise(resolve=>{release=resolve;});status=source==='desktop'?'unknown':'not_submitted';phase='sending';}
+   else{expect(body.id).toBe(operationId);status='confirmed';phase='complete';}
+  }
+  await route.fulfill({json:{operationId:operationId||null,status,phase,id:operationId?created:null,host:'local',
+   message:status==='unknown'?'发送结果待核对':status==='not_submitted'?'消息尚未发送':'',
+   ...(status==='not_submitted'?{text:'读取会话[合成来源](codex://threads/source)，继续完成'}:{})}});
+ });
+ await ready(page,'session-menu');await expect(page.locator('#login')).toBeHidden();
+ await page.evaluate(async source=>{
+  await BridgeFeatures.load('chat');BridgeI18n.setLanguage('zh');
+  for(const row of listRows){row.access={...row.access,source};row.runtime=source;}
+  listRenderStamp='';renderList();
+  window.__recoveryNavigation={openChat,loadList,opened:[]};
+  openChat=async(id,host)=>window.__recoveryNavigation.opened.push({id,host});loadList=async()=>{};
+ },source);
+ const row=page.locator('#sessions .session').first(),sourceId=await row.getAttribute('data-id');
+ await row.focus();await page.keyboard.press('Shift+F10');
+ const menu=page.locator('dialog.session-menu');await expect(menu).toBeVisible();
+ const labels=await menu.locator('.sm-row').allTextContents();expect(labels[labels.indexOf('会话详情')+1]).toBe('从会话恢复');
+ await menu.getByRole('button',{name:'从会话恢复',exact:true}).click();
+ await expect(menu.getByRole('status')).toHaveText('正在确认会话设置…');
+ expect(requests.filter(request=>request.method==='POST')).toHaveLength(1);
+ expect(requests[0].path).toBe('/api/sessions/'+sourceId+'/recover');
+ release();await expect(menu.getByRole('alert')).toHaveText(source==='desktop'?'发送结果待核对':'消息尚未发送');
+ await expect(menu.getByRole('button',{name:'打开新会话',exact:true})).toBeVisible();
+ expect(await menu.evaluate(node=>node.scrollWidth<=node.clientWidth+1)).toBe(true);
+ await testInfo.attach('recovery-'+source,{body:await menu.screenshot(),contentType:'image/png'});
+ if(source==='desktop'){
+  await expect(menu.getByRole('button',{name:'继续发送',exact:true})).toHaveCount(0);
+  status='confirmed';phase='complete';await menu.getByRole('button',{name:'核对结果',exact:true}).click();
+ }else{
+  await expect(menu).toContainText('读取会话[合成来源]');
+  await menu.getByRole('button',{name:'继续发送',exact:true}).click();
+ }
+ await expect(menu).toBeHidden();
+ expect(await page.evaluate(()=>window.__recoveryNavigation.opened)).toEqual([{id:created,host:'local'}]);
+ expect(requests.filter(request=>request.method==='POST')).toHaveLength(source==='desktop'?1:2);
+ await page.evaluate(()=>{openChat=window.__recoveryNavigation.openChat;loadList=window.__recoveryNavigation.loadList;delete window.__recoveryNavigation;});
+});
+
+test('a recovery request missing from the server is continued explicitly with the saved identity',async({page})=>{
+ const created='aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee',writes=[];let accept=false;
+ await page.route('**/api/sessions/*/recover?**',async route=>{
+  const request=route.request();
+  if(request.method()==='POST'){
+   const body=request.postDataJSON();writes.push(body);
+   if(!accept)return route.abort('failed');
+   return route.fulfill({json:{operationId:body.id,status:'confirmed',phase:'complete',id:created,host:'local'}});
+  }
+  return route.fulfill({json:{operationId:null,status:'idle',id:null,host:'local'}});
+ });
+ await ready(page,'session-menu');await expect(page.locator('#login')).toBeHidden();
+ await page.evaluate(async()=>{
+  await BridgeFeatures.load('chat');BridgeI18n.setLanguage('zh');
+  window.__recoveryNavigation={openChat,loadList,opened:[]};
+  openChat=async(id,host)=>window.__recoveryNavigation.opened.push({id,host});loadList=async()=>{};
+ });
+ const row=page.locator('#sessions .session').first(),menu=page.locator('dialog.session-menu');
+ await row.focus();await page.keyboard.press('Shift+F10');
+ await menu.getByRole('button',{name:'从会话恢复',exact:true}).click();
+ await expect(menu.getByRole('button',{name:'继续恢复',exact:true})).toBeVisible();
+ await expect(menu.getByRole('alert')).toContainText('尚未找到此次恢复记录');
+ expect(writes).toHaveLength(1);
+ await menu.getByRole('button',{name:'返回会话菜单',exact:true}).click();
+ await menu.getByRole('button',{name:'从会话恢复',exact:true}).click();
+ await expect(menu.getByRole('button',{name:'继续恢复',exact:true})).toBeVisible();expect(writes).toHaveLength(1);
+ accept=true;await menu.getByRole('button',{name:'继续恢复',exact:true}).click();
+ await expect(menu).toBeHidden();expect(writes).toHaveLength(2);expect(writes[1].id).toBe(writes[0].id);
+ expect(await page.evaluate(()=>window.__recoveryNavigation.opened)).toEqual([{id:created,host:'local'}]);
+ await page.evaluate(()=>{openChat=window.__recoveryNavigation.openChat;loadList=window.__recoveryNavigation.loadList;delete window.__recoveryNavigation;});
+});

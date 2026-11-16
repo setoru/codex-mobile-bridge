@@ -408,6 +408,78 @@ function sessionMenuContext(chat,provider='codex'){
       ['工作目录',view.cwd,true],['模型',[view.model,view.effort].filter(Boolean).join(' · ')],['提供商',view.provider],['项目',view.projectName]],
     notifications:async()=>{await ensure();if(provider==='codex')return $('notify-button').onclick();return desktopSessions.notifications();},
     manage:async()=>{try{await ensure();await openMessageManagement();}catch(error){toast(t(error.message));}}};
+  if(provider==='codex'&&['desktop','cli'].includes(access.source)){
+    const recoveryEntry=selectedCodexEntry,recoveryAccount=codexActiveAccountId;
+    const recoveryCurrent=()=>isCurrent()&&selectedCodexEntry===recoveryEntry&&codexActiveAccountId===recoveryAccount;
+    context.recover=async(report=()=>{},{mode='start',isVisible=()=>true}={})=>{
+      if(!recoveryCurrent())throw Error('连接或账号已变化，请重新打开会话菜单');
+      const navigation=JSON.stringify([clientNavigation.provider,currentId,currentHost,chatOpenGeneration]);
+      const canNavigate=()=>recoveryCurrent()&&isVisible()&&navigation===JSON.stringify([clientNavigation.provider,currentId,currentHost,chatOpenGeneration]);
+      const url=sessionUrl(chat.id,'recover',identity.host),key='session-recovery:'+JSON.stringify([scope,identity.host,chat.id]);
+      let operationId=sessionStorage.getItem(key);
+      const read=async()=>{
+        const requested=operationId;
+        const result=await api(url+(requested?(url.includes('?')?'&':'?')+'id='+encodeURIComponent(requested):''),undefined,undefined,recoveryCurrent);
+        return requested&&result.status==='idle'?{...result,operationId:requested,status:'not_submitted',phase:'creating',message:'尚未找到此次恢复记录，可继续恢复'}:result;
+      };
+      const remember=result=>{
+        if(result.operationId){
+          if(!operationId||sessionStorage.getItem(key)===operationId)sessionStorage.setItem(key,result.operationId);
+          operationId=result.operationId;
+        }
+        return result;
+      };
+      let result=await read();
+      if(!recoveryCurrent())throw Error('连接或账号已变化，请重新打开会话菜单');
+      const fresh=mode==='start'&&!operationId&&['idle','confirmed','failed'].includes(result.status)||mode==='retry'&&result.status==='failed'&&!result.id;
+      if(fresh){
+        operationId=uuid();sessionStorage.setItem(key,operationId);
+      }else if(result.operationId){
+        operationId=result.operationId;sessionStorage.setItem(key,operationId);
+      }
+      if(fresh||mode==='continue'&&result.status==='not_submitted'){
+        report({operationId,status:'running',phase:fresh?'creating':result.phase});
+        let submitting=true,timer;
+        const poll=async()=>{
+          if(!submitting||!recoveryCurrent()||!isVisible())return;
+          try{const snapshot=await read();if(submitting&&snapshot.status!=='idle'&&recoveryCurrent()){result=remember(snapshot);report(snapshot);}}
+          catch{/* The submitted request still owns its result; polling never retries it. */}
+          finally{if(submitting&&recoveryCurrent()&&isVisible())timer=setTimeout(poll,1000);}
+        };
+        timer=setTimeout(poll,500);
+        try{result=await api(url,{id:operationId},undefined,recoveryCurrent);}
+        catch(error){
+          if(!recoveryCurrent())throw error;
+          try{result=await read();}catch{result={...result,status:'unknown'};}
+          if(result.status==='idle')result={...result,status:'unknown'};
+          result={...result,operationId:result.operationId||operationId,message:result.message||'恢复结果尚未确认，请核对后再继续'};
+        }
+        finally{submitting=false;clearTimeout(timer);}
+      }
+      remember(result);
+      const until=Date.now()+120000;
+      while(result.status==='running'&&recoveryCurrent()&&isVisible()&&Date.now()<until){
+        report(result);await new Promise(resolve=>setTimeout(resolve,1000));
+        if(!recoveryCurrent()||!isVisible())break;
+        try{result=remember(await read());}catch(error){result={...result,status:'unknown',message:error.message};}
+      }
+      report(result);
+      if(result.status==='confirmed'){
+        if(sessionStorage.getItem(key)===operationId)sessionStorage.removeItem(key);
+        if(recoveryCurrent()){
+          await loadList(true);
+          if(canNavigate())await openChat(result.id,result.host);
+          else toast(t('新会话已创建，可在聊天列表查看'));
+        }
+      }
+      return result;
+    };
+    context.openRecovery=async result=>{
+      if(!recoveryCurrent())throw Error('连接或账号已变化，请重新打开会话菜单');
+      if(!result.id||result.host!==identity.host)throw Error('新会话身份尚未确认，请先核对恢复结果');
+      await openChat(result.id,result.host);
+    };
+  }
   if(['cli','ide'].includes(access.source)||view.backend==='cli'||view.runtime==='wsl')context.releaseCli=()=>cliConnectionsPanel.open({provider,sessionId:chat.id,host:identity.host});
   if(provider==='codex' && ['cli','ide'].includes(access.source) && (identity.host==='local'||identity.host.startsWith('codex:')))context.cliNetwork=async()=>{
     const url=sessionUrl(chat.id,'cli-network',identity.host), value=await api(url);

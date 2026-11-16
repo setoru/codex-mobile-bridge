@@ -104,6 +104,20 @@ class RegistryTests(unittest.TestCase):
         with self.assertRaises(ValueError): validate('POST', '/api/sessions', MAX_BODY+1)
         with self.assertRaises(ValueError): origin('http://example.com')
 
+    def test_recovery_routes_keep_the_existing_relay_method_and_target_boundary(self):
+        path = '/api/sessions/' + THREAD + '/recover?host=remote&id=' + THREAD
+        validate('GET', path)
+        validate('POST', path, len(json.dumps({'id': THREAD})))
+        for method, target in (('GET', '/api/sessions/' + THREAD + '/recover/extra'),
+                               ('POST', '/api/desktop-sessions/claude/recover'),
+                               ('POST', '/api/desktop-sessions/deepseek/recover')):
+            with self.subTest(method=method, target=target), self.assertRaises(PermissionError):
+                validate(method, target)
+        with self.assertRaises(ValueError):
+            validate('GET', path, 1)
+        with self.assertRaises(ValueError):
+            validate('DELETE', path)
+
     def test_desktop_allowlist_keeps_configuration_and_streams_local(self):
         for method in ('GET', 'POST'):
             validate(method, '/api/clients')
