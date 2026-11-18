@@ -60,6 +60,8 @@ Codex 列表下拉刷新使用浮层提示与按动画帧更新的位移，不�
 
 Codex 创建名称为可选字段，界面默认留空；缺省、空串或纯空格统一为空，只有手动名称才执行创建阶段的 `thread/name/set`。空名保持原生未命名状态，展示依次使用原生 `name`、内容 `preview` 和“未命名聊天”。CLI/WSL 接收 `thread/name/updated` 后刷新标题，并防止在途旧读取覆盖较新的名称。标题生成归原生客户端；Bridge 不创建标题临时会话、不发送额外模型请求，也不维护自动命名回执。详细契约与验证范围见[可选名称记录](.agents/notes/implemented/feature/2026-11-16-codex-optional-titles.md)。
 
+CLI 运行时在新线程完整读取时明确返回 `list_turns is not supported yet`，可通过同一原生连接的元数据读取完成身份确认；该读取保留实时内容并标记历史尚未完整加载。新线程可在原生持久化库存到达前打开并接受显式首条发送。创建回执的已知 ID 与完成分开，pending 重试只读核验同一已加入的原生线程，核对原目录、provider、人工名称和模型后安装会话；不重新创建、改名、恢复线程或发送消息。原连接丢失时保留 pending；ready 回执在连接丢失后只有匹配的原生持久化元数据才可报告可读。新建和 CLI 恢复共用即时身份核验后的安装流程，独立入口仍拒绝 Desktop 来源。详情见 [CLI 空标题创建修复](.agents/notes/implemented/bug-fix/2026-11-18-cli-empty-chat-creation.md)。
+
 DSH 项目聊天通过原生 workspace registry 的 `resolveByPath/create` 复用或登记工作区，再以 `workspaceId` 调用 `sessionController.create`。单独传入 cwd 不产生原生项目成员关系，因此不用于新建项目聊天。Claude Desktop Code 准确匹配已核验的原生 start 工作区信任拒绝时，标记为已阻止创建，界面保留目录、名称和首条消息，引导用户在 Desktop Code 亲自确认工作区信任后显式重试；网关不调用信任写接口。只有准确匹配的原生 start 信任拒绝可以解除该请求的未确认写入标记；断连、超时和其他错误仍保持结果未知，不自动重放。
 
 新建入口与原生 IPC 均受 App/运行时版本影响。Mac 空聊天创建和实际 App 接管已验证；本次新增原生项目接口及归属检查已通过安装版本的只读协议核验与合成回归，尚未执行真实项目创建或核验原生侧边栏刷新。Windows 及 SSH 创建目前只有模拟路径检查，不能视为实机通过。

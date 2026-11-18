@@ -10,6 +10,7 @@ import subprocess
 import threading
 import time
 import uuid
+from contextlib import contextmanager
 from pathlib import Path
 
 from bridge.features.sessions.identity import same_cwd
@@ -477,8 +478,25 @@ class CliSessions:
             starting_name_revision = (self.metadata.get(thread_id) or {}).get('nameRevision', 0)
             starting_turn_status = {turn.get('turnId'): turn.get('status')
                                     for turn in starting.get('turns', [])}
-        result = self.client.request('thread/read', {'threadId': thread_id, 'includeTurns': True},
-                                     replay_safe=True)
+        metadata_only = False
+        try:
+            result = self.client.request('thread/read', {'threadId': thread_id, 'includeTurns': True},
+                                         replay_safe=True)
+        except AppServerUnsupported as exc:
+            if str(exc) != 'list_turns is not supported yet':
+                raise
+            with self.lock:
+                if self.client.process is not process or self.joined.get(thread_id) is not process:
+                    raise AppServerUnavailable('CLI thread connection changed during read') from exc
+            if not self.client.is_loaded(thread_id):
+                self._invalidate(thread_id, expected_process=process)
+                raise AppServerUnavailable('CLI thread unloaded') from exc
+            with self.lock:
+                if self.client.process is not process or self.joined.get(thread_id) is not process:
+                    raise AppServerUnavailable('CLI thread connection changed during read') from exc
+            result = self.client.request('thread/read', {'threadId': thread_id, 'includeTurns': False},
+                                         replay_safe=True)
+            metadata_only = True
         thread = result.get('thread') or {}
         with self.lock:
             if self.client.process is not process or self.joined.get(thread_id) is not process:
@@ -499,6 +517,10 @@ class CliSessions:
                 pending = list(self.requests.get(thread_id, {}).values())
                 state = self._state(thread, pending, metadata)
                 previous = self.states.get(thread_id) or {}
+                if metadata_only:
+                    # An unsupported history read says nothing about existing turns.
+                    state['turns'] = copy.deepcopy(previous.get('turns') or [])
+                    state['turnsPagination'] = {'hasLoadedOldest': False}
                 if metadata.get('nameRevision', 0) != starting_name_revision:
                     state['threadName'] = metadata.get('threadName')
                     state['title'] = state['threadName'] or state['threadPreview'] or '未命名聊天'
@@ -543,6 +565,62 @@ class CliSessions:
             raise AppServerUnavailable(invalid_reason)
         self.on_state(thread_id, copy.deepcopy(state))
         return copy.deepcopy(state)
+
+    @contextmanager
+    def require_current(self, thread_id):
+        """Verify the original native thread, then guard a brief local state install."""
+        with self.lock:
+            process = self.client.process
+            metadata = copy.deepcopy(self.metadata.get(thread_id) or {})
+            token = metadata.get('connectionToken')
+            if process is None or self.joined.get(thread_id) is not process or not token:
+                raise AppServerUnavailable('CLI thread is not joined on this connection')
+            starting = self.states.get(thread_id) or {}
+            starting_model = starting.get('latestModel')
+            starting_effort = starting.get('latestReasoningEffort')
+            starting_name_revision = metadata.get('nameRevision', 0)
+
+        def same_connection():
+            return (self.client.process is process and self.joined.get(thread_id) is process and
+                    (self.metadata.get(thread_id) or {}).get('connectionToken') == token)
+
+        loaded = self.client.is_loaded(thread_id)
+        with self.lock:
+            if not same_connection():
+                raise AppServerUnavailable('CLI thread connection changed during read')
+        if not loaded:
+            self._invalidate(thread_id, expected_process=process)
+            raise AppServerUnavailable('CLI thread unloaded before the operation')
+        result = self.client.request('thread/read', {'threadId': thread_id, 'includeTurns': False},
+                                     replay_safe=True)
+        thread = result.get('thread') or {}
+        with self.lock:
+            if not same_connection():
+                raise AppServerUnavailable('CLI thread connection changed during read')
+            valid = (thread.get('id') == thread_id and thread.get('status', {}).get('type') != 'notLoaded' and
+                     same_cwd(metadata.get('cwd'), thread.get('cwd'), self.alias is None and os.name == 'nt') and
+                     thread.get('modelProvider') == metadata.get('modelProvider'))
+            if valid:
+                state = self.states.get(thread_id)
+                if state is None or state.get('id') != thread_id:
+                    raise AppServerUnavailable('CLI thread state has not been verified')
+                # Events received during the read are newer than its metadata response.
+                model_changed = (thread.get('model') is not None and
+                                 state.get('latestModel') == starting_model and
+                                 thread['model'] != state.get('latestModel'))
+                effort_changed = ('reasoningEffort' in thread and
+                                  state.get('latestReasoningEffort') == starting_effort and
+                                  thread['reasoningEffort'] != state.get('latestReasoningEffort'))
+                name_changed = ('name' in thread and
+                                self.metadata[thread_id].get('nameRevision', 0) == starting_name_revision and
+                                thread['name'] != state.get('threadName'))
+                if model_changed or effort_changed or name_changed:
+                    raise AppServerUnavailable('CLI thread settings changed during read')
+                # Only local installation belongs here; the native reads above do not hold this lock.
+                yield copy.deepcopy(state)
+                return
+        self._invalidate(thread_id, expected_process=process)
+        raise AppServerUnavailable('CLI thread identity changed before the operation')
 
     def call(self, thread_id, desktop_method, params, timeout=30):
         self._check_joined_identity(thread_id)

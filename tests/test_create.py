@@ -5,6 +5,7 @@ import sys
 import tempfile
 import unittest
 import uuid
+from contextlib import nullcontext
 from pathlib import Path
 from unittest.mock import patch
 
@@ -35,11 +36,13 @@ class CreationTests(unittest.TestCase):
         self.assertNotEqual(cli['key'], desktop['key'])
         rows = self.bridge.projects()
         self.assertEqual({row['type'] for row in rows if row['cwd'] == root}, {'cli', 'desktop'})
-        with patch.object(self.bridge.cli_sessions, 'create', return_value={
-                'id': self.tid, 'modelProvider': 'fixture-provider', 'cwd': root}) as create, \
+        state = {'id': self.tid, 'modelProvider': 'fixture-provider', 'cwd': root, 'threadName': 'New CLI'}
+        with patch.object(self.bridge.cli_sessions, 'create', return_value=state) as create, \
+             patch.object(self.bridge.cli_sessions, 'require_current', side_effect=lambda sid: nullcontext(state)) as verified, \
              patch('bridge.app.service.open_in_desktop') as opened:
             self.bridge.create_chat(cli['key'], 'New CLI', str(uuid.uuid4()), kind='cli')
             self.assertEqual(create.call_args.args, (root, 'New CLI'))
+            verified.assert_called_once_with(self.tid)
             opened.assert_not_called()
 
     def test_new_cli_directory_is_revalidated_before_runtime_dispatch(self):
@@ -305,8 +308,10 @@ class CreationTests(unittest.TestCase):
         cwd = str(self.root)
         self.bridge.store.list = lambda **kwargs: [{'origin': 'cli', 'cwd': cwd}]
         project = next(p for p in self.bridge.projects() if p['type'] == 'cli')
-        with patch.object(self.bridge.cli_sessions, 'create', return_value={'id': self.tid, 'cwd': cwd,
-                'modelProvider': 'openai', 'turns': [], 'requests': []}) as created, \
+        state = {'id': self.tid, 'cwd': cwd, 'modelProvider': 'openai', 'threadName': 'CLI chat', 'turns': [], 'requests': []}
+        with patch.object(self.bridge.cli_sessions, 'create', return_value=state) as created, \
+             patch.object(self.bridge.cli_sessions, 'refresh', return_value=state) as refreshed, \
+             patch.object(self.bridge.cli_sessions, 'require_current', side_effect=lambda sid: nullcontext(state)) as verified, \
              patch('bridge.app.service.open_in_desktop') as opened:
             request = str(uuid.uuid4())
             first = self.bridge.create_chat(project['key'], 'CLI chat', request, kind='cli')
@@ -317,6 +322,8 @@ class CreationTests(unittest.TestCase):
             self.assertEqual(created.call_args.args, (cwd, 'CLI chat'))
             self.assertIn('on_start', created.call_args.kwargs)
             self.assertIn('on_created', created.call_args.kwargs)
+            refreshed.assert_called_once_with(self.tid)
+            self.assertEqual(verified.call_count, 2)
             opened.assert_not_called()
         with self.assertRaises(ValueError):
             self.bridge.create_chat(project['key'], 'CLI chat', request, kind='desktop')

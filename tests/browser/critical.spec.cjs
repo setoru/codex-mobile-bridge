@@ -834,6 +834,64 @@ test('Codex new-chat names are optional and preserve explicit titles and uncerta
   }
 });
 
+test('empty-name Codex CLI creation retries its original request and sends the first message once', async ({page}) => {
+  const createdId='aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee',writes=[],reads=[];
+  await page.route('**/api/projects**',route=>route.fulfill({json:{
+    projects:[{key:'cli|local|fixture',type:'cli',host:'local',cwd:'/fixture/project',name:'Project'}],
+    environments:[{key:'cli|local',type:'cli',host:'local',name:'Local'}],
+  }}));
+  await page.route('**/api/sessions**',route=>{
+    const request=route.request(),url=new URL(request.url()),pathname=url.pathname;
+    if(request.method()==='POST'){
+      writes.push({pathname,host:url.searchParams.get('host'),body:request.postDataJSON()});
+      if(pathname==='/api/sessions')return writes.length===1
+        ?route.fulfill({status:500,json:{error:'Synthetic gateway error; check logs'}})
+        :route.fulfill({json:{id:createdId,host:'local',message:'聊天已创建，可以直接发送消息'}});
+      if(pathname===`/api/sessions/${createdId}/send`)return route.fulfill({json:{status:'accepted'}});
+      return route.fulfill({status:405,json:{error:'Unexpected synthetic write'}});
+    }
+    if(pathname==='/api/sessions')return route.fulfill({json:{sessions:[],complete:true,availableSources:['cli'],remoteHosts:[]}});
+    reads.push({pathname,host:url.searchParams.get('host')});
+    if(pathname===`/api/sessions/${createdId}/timeline`)return route.fulfill({json:{
+      sequence:1,epoch:createdId,before:null,hasMore:false,files:[],rows:[],
+      meta:{id:createdId,host:'local',title:'未命名聊天',cwd:'/fixture/project',connected:true,
+        loadingHistory:false,historyComplete:true,status:'idle',requests:[],submissions:[],draftAccountIdentity:'fixture-account',
+        access:{source:'cli',runtime:'cli',canSend:true,canReconnect:true,canConfigure:false,readOnly:false}},
+    }});
+    if(pathname.endsWith('/changes'))return route.abort();
+    return route.fulfill({json:{}});
+  });
+  await ready(page,'session-menu');
+  await page.evaluate(()=>{currentHost='local';listSource='cli';});
+  await page.locator('#new-chat').click();
+  await expect(page.locator('#new-chat-title')).toHaveValue('');
+  await expect(page.locator('#new-chat-submit')).toBeEnabled();
+  await page.locator('#new-chat-submit').click();
+  await expect(page.locator('#new-chat-error')).toContainText('Synthetic gateway error');
+  await expect(page.locator('#new-chat-dialog')).toBeVisible();
+  await expect(page.locator('#new-chat-submit')).toBeEnabled();
+  expect(writes).toHaveLength(1);
+  expect(reads.some(value=>value.pathname.endsWith('/timeline'))).toBe(false);
+  await page.locator('#new-chat-submit').click();
+  await expect(page.locator('#new-chat-dialog')).toBeHidden();
+  await expect(page.locator('#chat-title')).toHaveText('未命名聊天');
+  await expect(page.locator('#send')).toBeEnabled();
+  expect(writes).toHaveLength(2);
+  expect(writes[0].body.title).toBe('');expect(writes[0].body.kind).toBe('cli');
+  expect(writes[1].body.id).toBe(writes[0].body.id);
+  expect(writes[1].body.title).toBe('');
+  expect(reads).toContainEqual({pathname:`/api/sessions/${createdId}/timeline`,host:'local'});
+  expect(await page.evaluate(()=>({id:currentId,host:currentHost}))).toEqual({id:createdId,host:'local'});
+  await page.locator('#message').fill('Synthetic first instruction');
+  await page.locator('#send').click();
+  await expect.poll(()=>writes.length).toBe(3);
+  expect(writes[2]).toMatchObject({pathname:`/api/sessions/${createdId}/send`,host:'local',body:{text:'Synthetic first instruction',mode:'send'}});
+  expect(writes[2].body.id).toMatch(/^[0-9a-f-]{36}$/);
+  await expect(page.locator('#message')).toHaveValue('');
+  await expect(page.locator('#send-error')).toHaveText('');
+  expect(writes.filter(value=>value.pathname.endsWith('/send'))).toHaveLength(1);
+});
+
 test('cached new-chat choices survive catalog verification', async ({page}) => {
   await ready(page,'session-menu');await page.evaluate(async()=>{await BridgeFeatures.load('chat');BridgeI18n.setLanguage('zh');});
   await page.evaluate(()=>{

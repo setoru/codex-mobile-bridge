@@ -4,6 +4,7 @@ import subprocess
 import sys
 import unittest
 import uuid
+from contextlib import nullcontext
 from pathlib import Path
 from unittest.mock import AsyncMock, Mock, patch
 
@@ -120,14 +121,21 @@ class CreationChoices(unittest.TestCase):
             self.assertEqual(result['currentModel'],'chosen');self.assertEqual(bridge.project_host('local|independent'),'codex:separate')
             self.assertTrue(str(bridge.cli_sessions.creation_context.call_args.args[0]).startswith(str(bridge.data_dir.resolve())))
             selected={'model':'chosen','effort':'low','modelCatalogIdentity':'separate-cache'};identifier=str(uuid.uuid4());attempt=str(uuid.uuid4())
+            state = {}
             def create(cwd,title,**options):
                 self.assertTrue(Path(cwd).is_relative_to(bridge.data_dir.resolve()));self.assertEqual(options['model'],'chosen');self.assertEqual(options['effort'],'low')
                 options['on_start']();options['on_created'](identifier)
-                return {'id':identifier,'cwd':cwd,'modelProvider':'separate','turns':[],'requests':[]}
+                state.update(id=identifier, cwd=cwd, modelProvider='separate', threadName=title,
+                             latestModel='chosen', latestReasoningEffort='low', turns=[], requests=[])
+                return dict(state)
             bridge.cli_sessions.create=Mock(side_effect=create)
+            bridge.cli_sessions.refresh=Mock(side_effect=lambda sid: dict(state))
+            bridge.cli_sessions.require_current=Mock(side_effect=lambda sid: nullcontext(dict(state)))
             self.assertEqual(bridge.create_chat('codex:separate|independent','Separate',attempt,model_options=selected)['id'],identifier)
             self.assertEqual(bridge.create_chat('codex:separate|independent','Separate',attempt,model_options={**selected,'modelCatalogIdentity':'refreshed'})['id'],identifier)
             self.assertEqual(bridge.cli_sessions.create.call_count,1)
+            bridge.cli_sessions.refresh.assert_called_once_with(identifier)
+            self.assertEqual(bridge.cli_sessions.require_current.call_count,2)
 
     def test_project_config_changes_invalidate_catalog_without_reusing_global_account_models(self):
         with tempfile.TemporaryDirectory() as folder:

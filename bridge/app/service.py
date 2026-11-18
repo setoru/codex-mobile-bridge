@@ -789,18 +789,11 @@ class Bridge:
         if source['kind'] == 'cli':
             state = self.cli_sessions.create(source['cwd'], settings=source['settings'],
                                              on_start=started, on_created=created)
-            session = self.session(state['id'], attach=False)
-            with session.condition:
-                session.origin = 'cli'
-                session.origin_verified = True
-                session.runtime = 'cli'
-                session.saved_cwd = source['cwd']
-                session.saved_provider = source['settings']['modelProvider']
-                session.owner = 'cli:' + state['id']
-                session.connected = True
-                session.state = state
-                session.access = self._access('cli', session)
-                session.changed()
+            from bridge.features.sessions.create import verify_creation_settings
+            with self.cli_sessions.require_current(state['id']) as current:
+                verify_creation_settings(current, source['settings'], source['cwd'],
+                                         local_windows=self.local and os.name == 'nt')
+                self._install_created_cli_session(current, cwd=source['cwd'])
         elif self.local:
             create_empty(self.catalog_reader.executable, self.codex_home, source['cwd'],
                          settings=source['settings'], on_start=started, on_created=created,
@@ -1163,14 +1156,23 @@ print(json.dumps(reply, ensure_ascii=False))
             project = {'host': self.host, 'cwd': None}
         if project is None:
             raise ValueError('请选择电脑 App 中已保存的项目')
+        if project.get('hostIdentity') and self.hosts.hosts().get(project['host'], {}).get('alias') != project['hostIdentity']:
+            raise ValueError('原 SSH 主机配置已变化，请重新选择项目')
+        if kind == 'cli':
+            cli_bridge = self.for_host(project['host'])
+            if (not cli_bridge.local and
+                    cli_bridge.cli_sessions.alias != self.hosts.hosts().get(project['host'], {}).get('alias')):
+                raise ValueError('原 SSH 主机配置已变化，请重启网关后重新选择项目')
         with self.create_lock:
             entry = self.creations.get(request_id)
+            created_now = False
             if entry:
                 if entry.get('recoverySource'):
                     raise ValueError('同一创建请求不能用于不同操作')
                 if (entry['project'] != project_key or entry['title'] != title or
                         entry.get('kind', 'desktop') != kind or
                         intent(entry.get('modelOptions', {})) != intent(model_options) or
+                        entry.get('host', project['host']) != project['host'] or
                         entry.get('cwd', project['cwd']) != project['cwd']):
                     raise ValueError('同一创建请求不能用于不同内容')
                 if not entry.get('id') and entry.get('phase') not in ('registering-project', 'project-ready'):
@@ -1179,13 +1181,6 @@ print(json.dumps(reply, ensure_ascii=False))
                 if model_options:
                     from bridge.features.sessions.creation_models import validate
                     validate(model_options, self.creation_models(project_key, kind))
-                if project.get('hostIdentity') and self.hosts.hosts().get(project['host'], {}).get('alias') != project['hostIdentity']:
-                    raise ValueError('原 SSH 主机配置已变化，请重新选择项目')
-                if kind == 'cli':
-                    cli_bridge = self.for_host(project['host'])
-                    if (not cli_bridge.local and
-                            cli_bridge.cli_sessions.alias != self.hosts.hosts()[project['host']]['alias']):
-                        raise ValueError('原 SSH 主机配置已变化，请重启网关后重新选择项目')
                 if kind == 'desktop':
                     self.ipc.connect()
                 entry = {'project': project_key, 'title': title, 'kind': kind,
@@ -1206,6 +1201,7 @@ print(json.dumps(reply, ensure_ascii=False))
 
                     def mark_created(created_id):
                         entry['id'] = created_id
+                        entry['phase'] = 'created'
                         self._save_creations()
 
                     try:
@@ -1221,15 +1217,20 @@ print(json.dumps(reply, ensure_ascii=False))
                                 cli_bridge.cli_sessions.alias != self.hosts.hosts().get(project['host'], {}).get('alias')):
                             raise ValueError('原 SSH 主机配置已变化，请重启网关后重新选择项目')
                         runtime_cwd = project['cwd'] or independent_directory(self.data_dir, request_id)
+                        entry['runtimeCwd'] = runtime_cwd
                         state = cli_bridge.cli_sessions.create(
                             runtime_cwd, title, on_start=mark_started, on_created=mark_created,
                             **{key: model_options[key] for key in ('model', 'effort') if key in model_options})
                         thread_id = state['id']
-                    except AppServerUnavailable:
+                    except AppServerUnavailable as exc:
                         if not entry.get('started'):
                             del self.creations[request_id]
                             self._save_creations()
+                        elif entry.get('id'):
+                            raise CreationError('CLI 聊天已创建，但尚未确认可用；请重试本次创建以核验同一聊天，不会重复创建') from exc
                         raise
+                    except AppServerError as exc:
+                        raise CreationError('CLI 创建结果尚未完成确认；请重试本次创建以核验结果，不会重复创建') from exc
                 elif project['host'] == 'local':
                     try:
                         cwd = (project_directory(project['cwd'], expected=project['directoryIdentity'])['cwd']
@@ -1266,24 +1267,12 @@ print(json.dumps(reply, ensure_ascii=False))
                     thread_id = ssh_read(host['alias'], source, timeout=90)['id']
                 uuid.UUID(thread_id)
                 entry['id'] = thread_id
+                created_now = True
                 if kind == 'desktop' and model_options:
                     entry['modelSettingsPhase'] = 'pending'
                 self._save_creations()
-                if kind == 'cli':
-                    bridge = cli_bridge
-                    with bridge.lock:
-                        session = bridge.live.setdefault(thread_id, LiveSession(thread_id, question_skips=bridge.question_skips))
-                    with session.condition:
-                        session.origin = 'cli'
-                        session.origin_verified = True
-                        session.saved_cwd = runtime_cwd
-                        session.saved_provider = state['modelProvider']
-                        session.runtime = 'cli'
-                        session.owner = 'cli:' + thread_id
-                        session.connected = True
-                        session.state = state
-                        session.access = bridge._access('cli', session)
-                        session.changed()
+            if kind == 'cli':
+                self._complete_cli_creation(entry, cli_bridge, request_id, refresh=not created_now)
             bridge = self.for_host(entry['host'])
             if isinstance(bridge.store, RemoteStore):
                 with bridge.store.lock:
@@ -1299,6 +1288,75 @@ print(json.dumps(reply, ensure_ascii=False))
             self._complete_creation_settings(entry, bridge)
             return {'id': entry['id'], 'host': entry['host'], 'opened': opened,
                     'message': '已创建，正在连接桌面 App' if opened else '聊天已创建，请在电脑 App 打开后重新连接'}
+
+    def _complete_cli_creation(self, entry, bridge, request_id, *, refresh):
+        # A recorded ID proves thread/start returned, not that creation finished.
+        # Complete the same joined thread with reads; never repeat native writes.
+        identifier = entry['id']
+        cwd = entry.get('runtimeCwd') or entry.get('cwd')
+        if not cwd:
+            directory = self.data_dir / 'independent-chats' / request_id
+            if directory.is_dir():
+                cwd = str(directory.resolve())
+        if not cwd:
+            raise CreationError('CLI 聊天已创建，但原工作目录尚未确认；请在聊天列表核对，不要重复创建')
+        try:
+            if refresh:
+                bridge.cli_sessions.refresh(identifier)
+            with bridge.cli_sessions.require_current(identifier) as state:
+                provider = state.get('modelProvider')
+                if (state.get('id') != identifier or not provider or
+                        not same_cwd(cwd, state.get('cwd'), bridge.local and os.name == 'nt') or
+                        entry.get('modelProvider', provider) != provider):
+                    raise CreationError('CLI 聊天已创建，但原会话身份尚未确认；请核对同一聊天，不要重复创建')
+                if entry.get('phase') != 'ready':
+                    if entry['title'] and state.get('threadName') != entry['title']:
+                        raise CreationError('CLI 聊天已创建，但人工名称尚未确认；请在原聊天核对名称，不会重复改名或创建')
+                    choice = entry.get('modelOptions', {})
+                    if (choice.get('model') is not None and state.get('latestModel') != choice['model'] or
+                            choice.get('effort') is not None and state.get('latestReasoningEffort') != choice['effort']):
+                        raise CreationError('CLI 聊天已创建，但模型或思考强度尚未确认；请核对同一聊天，不会重复设置或创建')
+                bridge._install_created_cli_session(state, cwd=cwd)
+        except AppServerUnavailable as exc:
+            # Completed receipts can outlive their proxy. Only authoritative saved
+            # metadata can establish readability after the original join is gone.
+            if entry.get('phase') == 'ready':
+                try:
+                    saved = bridge.store.get(identifier)
+                except (KeyError, StoreUnavailable, RemoteUnavailable):
+                    saved = {}
+                if (saved.get('id') == identifier and saved.get('origin') == 'cli' and
+                        same_cwd(cwd, saved.get('cwd'), bridge.local and os.name == 'nt') and
+                        entry.get('modelProvider') and saved.get('model_provider') == entry['modelProvider']):
+                    return
+            raise CreationError('CLI 聊天已创建，但原连接尚未确认；请在聊天列表核对或显式继续原聊天，不会重复创建') from exc
+        except AppServerError as exc:
+            raise CreationError('CLI 聊天已创建，但读取结果尚未确认；请重试本次创建以核验同一聊天，不会重复创建') from exc
+        entry.update(phase='ready', runtimeCwd=cwd, modelProvider=provider)
+        self._save_creations()
+
+    def _install_created_cli_session(self, state, *, cwd):
+        # The caller holds require_current's short guard for this native join.
+        identifier = state['id']
+        with self.lock:
+            session = self.live.setdefault(identifier, LiveSession(identifier, question_skips=self.question_skips))
+        with session.condition:
+            if (session.origin_verified and session.origin != 'cli' or
+                    session.connected and session.runtime != 'cli' or session.desktop_owner_probe == 'found'):
+                raise CreationError('新聊天的原生归属与已有会话冲突；请核对原会话，不会切换执行连接')
+            session.origin = 'cli'
+            session.origin_verified = True
+            session.saved_cwd = cwd
+            session.saved_provider = state['modelProvider']
+            session.runtime = 'cli'
+            session.owner = 'cli:' + identifier
+            session.connected = True
+            session.discovering = False
+            session.error = None
+            session.state = state
+            session.access = self._access('cli', session)
+            session.changed()
+        return session
 
     def _complete_creation_settings(self, entry, bridge):
         # An empty thread's temporary creator does not own Desktop's composer.
@@ -2607,8 +2665,27 @@ print(json.dumps(reply, ensure_ascii=False))
     def activate(self, thread_id, *, allow_ide_resume=True, _transport_rebuilt=False):
         """Explicit phone operation only; reads and notification watches never navigate."""
         session = self.session(thread_id, background=True)
-        if self.host.startswith('codex:') and self.store.get(thread_id).get('origin') == 'desktop':
-            raise ValueError('此独立入口只接入原 VS Code / CLI 会话')
+        if self.host.startswith('codex:'):
+            try:
+                origin = self.store.get(thread_id).get('origin')
+            except KeyError:
+                with session.condition:
+                    fresh_cli = (session.origin_verified and session.origin == 'cli' and
+                                 session.runtime == 'cli' and session.connected)
+                if not fresh_cli:
+                    raise
+                # A new CLI thread may precede its SQLite row. Its existing
+                # native join, not cached display metadata, must confirm it.
+                try:
+                    with self.cli_sessions.require_current(thread_id) as current:
+                        if (current.get('modelProvider') != session.saved_provider or
+                                not same_cwd(session.saved_cwd, current.get('cwd'), self.local and os.name == 'nt')):
+                            raise IPCError('原 CLI 会话身份已变化；操作未发送')
+                        origin = 'cli'
+                except AppServerError as exc:
+                    raise IPCError(str(exc)) from exc
+            if origin == 'desktop':
+                raise ValueError('此独立入口只接入原 VS Code / CLI 会话')
         with session.activation_lock:
             self.released_cli.set(thread_id, False)
             endpoint_changed = not _transport_rebuilt and session.runtime == 'desktop' and self.ipc.endpoint_changed()
