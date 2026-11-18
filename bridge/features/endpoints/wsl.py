@@ -27,6 +27,7 @@ from bridge.features.sessions.archive import ArchiveCommands
 from bridge.features.sessions.organization_commands import OrganizationCommands
 from bridge.features.sessions.compaction import CompactCommands
 from bridge.features.sessions.create import check_archive_runtime
+from bridge.features.sessions.recovery import RecoveryCommands
 from bridge.features.sessions.pins import SessionPins
 from bridge.features.sessions.organization import organization as native_organization
 from bridge.features.sessions.projects import Projects
@@ -133,6 +134,7 @@ class WslEntry(WslFeatures):
         self.create_lock = threading.RLock()
         self.creations_path = self.data_dir / 'creations.json'
         self.creations = json.loads(self.creations_path.read_text(encoding='utf-8')) if self.creations_path.exists() else {}
+        self.recovery_commands = RecoveryCommands(self.creations, self.create_lock, self._save_creations, self.host)
         self.store = WslStore(self)
         self.directory_projects = Projects(self.data_dir)
         self.uploads = Uploads(self.data_dir, lambda *args: upload_file(self.row['distribution'], *args, reader=self.read))
@@ -399,6 +401,7 @@ class WslEntry(WslFeatures):
             'canInterrupt': connected,
             'canApprove': connected,
             'canReconnect': True,
+            'canRecover': True,
             'canConfigure': connected,
             'canChangePermissions': connected,
             'canChangeModel': connected,
@@ -867,38 +870,130 @@ class WslEntry(WslFeatures):
                     source += source_text('features/sessions/create.py')
                     source += '\nprint(json.dumps(project_directory(**' + payload({'value': project['cwd'], 'expected': project.get('directoryIdentity')}) + ')))\n'
                 cwd = self.read(self.row['distribution'], source)['cwd']
-                proof = self._check_account_route(runtime, {'cwd': cwd}, new=True)
-                receipt = self.creations[request_id] = {'project': project_key, 'title': title, 'cwd': cwd}
+                receipt = {'project': project_key, 'title': title, 'cwd': cwd}
                 if model_options:
                     receipt['modelOptions'] = model_options
-                self.data_dir.mkdir(parents=True, exist_ok=True)
-                private_json(self.creations_path, self.creations)
-                try:
-                    from bridge.features.sessions.create import model_overrides
-                    started = runtime.request('thread/start', {'cwd': cwd, 'ephemeral': False,
-                        **model_overrides(model_options.get('model'), model_options.get('effort'))})
-                    created = started['thread']
-                    identifier = created['id']
-                    uuid.UUID(identifier)
-                    if created.get('cwd') != cwd or created.get('parentThreadId'):
-                        raise IPCError('新会话身份未确认')
-                    if proof is not None:
-                        if created.get('modelProvider') != proof[4]:
-                            raise IPCError('新会话提供商与已选择的 WSL API 不一致')
-                        self._managed_routes[identifier] = (*proof[:-1], created.get('model'))
+
+                def mark_started():
+                    self.creations[request_id] = receipt
+                    self._save_creations()
+
+                def mark_created(identifier):
                     receipt['id'] = identifier
-                    private_json(self.creations_path, self.creations)
-                    if model_options and (started.get('model') != model_options['model'] or
-                            'effort' in model_options and started.get('reasoningEffort') != model_options['effort']):
-                        raise IPCError('新聊天已创建，但模型或思考强度未确认；请检查原会话')
-                    if title:
-                        runtime.request('thread/name/set', {'threadId': identifier, 'name': title})
-                    # Force durable empty-thread history before exposing it in lists.
-                    runtime.request('thread/read', {'threadId': identifier, 'includeTurns': True})
+                    self._save_creations()
+
+                try:
+                    identifier, _ = self._create_native_chat(runtime, cwd, model_options,
+                        title=title, on_start=mark_started, on_created=mark_created)
                 except Exception:
+                    if request_id not in self.creations:
+                        raise
                     raise IPCError('创建结果待核对，请先刷新聊天列表；不会重复创建') from None
             self.activate(identifier)
             return {'id': identifier, 'host': self.host, 'opened': True, 'message': '聊天已创建，可以直接发送消息'}
+
+    def _create_native_chat(self, runtime, cwd, options, *, on_start, on_created, title=''):
+        from bridge.features.sessions.create import model_overrides, verify_creation_settings
+        extra = {'service_tier': options['serviceTier']} if 'serviceTier' in options else {}
+        overrides = model_overrides(options.get('model'), options.get('effort'), **extra)
+        generation = self.generation
+        proof = self._check_account_route(runtime, {'cwd': cwd}, new=True)
+        on_start()
+        result = runtime.request('thread/start', {'cwd': cwd, 'ephemeral': False, **overrides})
+        thread = result.get('thread') or {}
+        identifier = thread.get('id')
+        uuid.UUID(identifier)
+        on_created(identifier)
+
+        def confirm(current):
+            if (runtime.closed or self.server is not runtime or self.generation != generation or
+                    current.get('id') != identifier or current.get('cwd') != cwd or
+                    current.get('parentThreadId') or current.get('threadSource') == 'subagent' or
+                    current.get('modelProvider') != thread.get('modelProvider')):
+                raise IPCError('新会话身份或连接尚未确认，请在新聊天核对')
+
+        confirm(thread)
+        if proof is not None:
+            if thread.get('modelProvider') != proof[4]:
+                raise IPCError('新会话提供商与已选择的 WSL API 不一致')
+            self._managed_routes[identifier] = (*proof[:-1], result.get('model') or thread.get('model'))
+        if overrides:
+            verify_creation_settings(result, overrides, cwd)
+        if title:
+            runtime.request('thread/name/set', {'threadId': identifier, 'name': title})
+        saved = runtime.request('thread/read', {'threadId': identifier, 'includeTurns': True}).get('thread') or {}
+        confirm(saved)
+        with self.lock:
+            session = self.live.setdefault(identifier, Session(identifier))
+        with session.condition:
+            session.state.update(cwd=cwd, modelProvider=thread.get('modelProvider'),
+                                 latestModel=result.get('model') or thread.get('model'),
+                                 latestReasoningEffort=result.get('reasoningEffort') or thread.get('reasoningEffort'))
+            if 'serviceTier' in result:
+                session.state['latestThreadSettings'] = {'serviceTier': result['serviceTier']}
+            permissions = {key: copy.deepcopy(result[key]) for key in
+                           ('approvalPolicy', 'approvalsReviewer', 'activePermissionProfile') if key in result}
+            if 'sandbox' in result:
+                permissions['sandboxPolicy'] = copy.deepcopy(result['sandbox'])
+            if permissions:
+                session.state['currentPermissions'] = permissions
+        return identifier, overrides
+
+    def _save_creations(self):
+        self.data_dir.mkdir(parents=True, exist_ok=True)
+        private_json(self.creations_path, self.creations)
+
+    def recover(self, identifier, body=None, *, request_id=None):
+        self._require_open()
+        if body is None:
+            return self.recovery_commands.read(identifier, request_id)
+        if (not isinstance(body, dict) or 'id' not in body or set(body) - {'id', 'sourceContext'} or
+                not isinstance(body['id'], str)):
+            raise ValueError('从会话恢复请求无效')
+        return self.recovery_commands.perform(identifier, body['id'],
+            prepare=lambda: self._recovery_source(identifier), create=self._recovery_create,
+            execute=self._run_recovery)
+
+    @_entry_write
+    def _run_recovery(self, run):
+        return run()
+
+    def _recovery_source(self, identifier):
+        from bridge.features.sessions.recovery import recovery_source
+        metadata = self.store.get(identifier)
+        with self.lock:
+            session = self.live.get(identifier)
+        state = None
+        if session is not None:
+            with session.condition:
+                if session.connected:
+                    state = copy.deepcopy(session.state)
+        if state is None:
+            try:
+                state = self.store.history(identifier, turn_limit=1)
+            except (OSError, ValueError, StoreUnavailable, RemoteUnavailable):
+                state = {}
+        # The WSL route is a gateway identity, not a native hostId.
+        return recovery_source(state, metadata, identifier, 'local', kind='cli')
+
+    def _recovery_create(self, entry, started, created):
+        from bridge.features.sessions.create import verify_creation_settings
+        source = entry['sourceSnapshot']
+        cwd = source['cwd']
+        script = source_text('features/sessions/create.py')
+        script += '\nprint(json.dumps(project_directory(**' + payload({'value': cwd, 'trim': False}) + ')))\n'
+        self.read(self.row['distribution'], script)
+        runtime = self.runtime(allow_start=True)
+        identifier, overrides = self._create_native_chat(runtime, cwd, source['modelOptions'],
+            on_start=started, on_created=created)
+        session = self.activate(identifier)
+        with session.condition:
+            if not session.connected:
+                raise IPCError('新会话连接尚未确认，请在新聊天重新连接')
+            if overrides:
+                verify_creation_settings(session.state, overrides, cwd)
+        return {'ready': True, 'opened': True, 'message': '聊天已创建，可以直接发送消息',
+                'draftAccountIdentity': self._management_identity(identifier, refresh=True)}
 
     @_entry_write
     def _mutation(self, identifier, key, value, call):

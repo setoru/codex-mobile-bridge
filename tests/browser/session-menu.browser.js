@@ -26,21 +26,17 @@ async function runSessionMenuBrowserChecks(){
     check(recoveryRows[recoveryRows.indexOf('会话详情')+1]==='从会话恢复','recovery follows session details');
     const recoverButton=[...menu.box.querySelectorAll('button')].find(button=>button.textContent==='从会话恢复');
     recoverButton.click();recoverButton.click();await new Promise(done=>setTimeout(done,0));
-    check(calls.filter(row=>row[0]==='recover').length===1,'pending recovery is submitted once');
-    recovered({status:'confirmed'});await new Promise(done=>setTimeout(done,0));check(!menu.box,'confirmed recovery closes its menu');
-    let finishRecovery;
-    menu.show({...context(),recover:(report,options)=>{
-      calls.push(['recover-stage',options.mode]);report({status:'running',phase:'settings'});
-      return new Promise(done=>{finishRecovery=done;});
-    },openRecovery:result=>calls.push(['open-recovered',result.id])},{element:anchor});
+    check(calls.filter(row=>row[0]==='recover').length===1&&recoverButton.disabled,'pending recovery is submitted once and disables its ordinary menu action');
+    recovered({status:'created',id:'created',ready:true});await new Promise(done=>setTimeout(done,0));check(!menu.box,'confirmed recovery closes its menu');
+    let rejectRecovery=true;
+    menu.show({...context(),recover:async()=>{
+      calls.push(['recover-simple']);if(rejectRecovery)throw Error('创建结果尚未确认');
+      return {status:'created',id:'created',ready:false};
+    }},{element:anchor});
     await click('从会话恢复');
-    check(menu.box.querySelector('[role=status]')?.textContent==='正在确认会话设置…','recovery displays current progress');
-    finishRecovery({status:'not_submitted',phase:'sending',id:'created',message:'消息尚未发送',text:'读取会话[示例](codex://threads/source)，继续完成'});
-    await new Promise(done=>setTimeout(done,0));
-    check(menu.box.textContent.includes('读取会话[示例]')&&menu.box.textContent.includes('打开新会话'),'unsent recovery retains its text and destination');
-    await click('继续发送');check(calls.at(-1)[1]==='continue','continuation is an explicit user action');
-    finishRecovery({status:'unknown',phase:'sending',id:'created',message:'结果待核对'});await new Promise(done=>setTimeout(done,0));
-    check(!menu.box.textContent.includes('继续发送')&&menu.box.textContent.includes('核对结果'),'unknown sending exposes only read reconciliation');
+    check(menu.box.querySelector('[role=alert]')?.textContent==='创建结果尚未确认','creation errors stay in the ordinary menu');
+    check(!menu.box.textContent.includes('核对结果')&&!menu.box.textContent.includes('继续恢复'),'recovery has no dedicated reconciliation page');
+    rejectRecovery=false;await click('从会话恢复');check(!menu.box,'a known creation leaves the menu even when its first send is not ready');
     menu.show({...context(),link:null},{element:anchor});await click('复制 Session ID');check(calls.at(-1)[1]==='synthetic-session','other clients copy native session ID directly');
     await click('项目');check(menu.box.querySelector('[aria-pressed=true]').textContent.includes('当前项目'),'native selection is marked');
     await click('目标项目');check(calls.at(-1)[1].targetId==='project-b'&&calls.at(-1)[1].expectedId==='project-a','native project move preserves prior identity');

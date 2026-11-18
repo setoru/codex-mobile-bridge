@@ -78,6 +78,30 @@ Path(sys.argv[2]).write_text(json.dumps(calls))
             'permissions': ':workspace', 'approvalPolicy': 'on-request',
             'approvalsReviewer': 'user', 'runtimeWorkspaceRoots': [str(self.root)]})
 
+    def test_model_creation_uses_native_permissions_and_can_copy_or_clear_speed(self):
+        for tier in ('fast', None):
+            with self.subTest(tier=tier):
+                self.reply['serviceTier'] = tier
+                result = create_empty('fixture-runtime', self.root, str(self.root),
+                                      model='source-model', effort='high', service_tier=tier)
+                self.assertEqual(result, self.identifier)
+                calls = json.loads(self.log.read_text())
+                start = next(row['params'] for row in calls if row['method'] == 'thread/start')
+                self.assertEqual(start, {'cwd': str(self.root), 'ephemeral': False,
+                                        'model': 'source-model',
+                                        'config': {'model_reasoning_effort': 'high'}, 'serviceTier': tier})
+                self.assertFalse(any(row['method'] == 'turn/start' for row in calls))
+
+    def test_unconfirmed_speed_retains_the_native_created_id(self):
+        self.reply['serviceTier'] = 'default'
+        created = []
+        with self.assertRaises(CreationError) as caught:
+            create_empty('fixture-runtime', self.root, str(self.root), model='source-model',
+                         service_tier='fast', on_created=created.append)
+        self.assertEqual(created, [self.identifier])
+        self.assertEqual(caught.exception.created_id, self.identifier)
+        self.assertFalse(any(row['method'] == 'turn/start' for row in json.loads(self.log.read_text())))
+
     def test_creation_keeps_new_id_when_saved_identity_does_not_match(self):
         self.saved_thread = {**self.reply['thread'], 'cwd': str(self.root / 'different-worktree')}
         created = []

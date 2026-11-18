@@ -27,11 +27,11 @@ Claude Desktop Code 若提示需要信任工作区，请在电脑的 Claude Desk
 
 ## 从会话恢复
 
-在会话列表右键或长按一个 Codex App／CLI 会话，在“会话详情”下选择 **从会话恢复**。系统沿用原接入、主机、实际工作目录及可核验的模型、思考强度、速度和权限设置，新建空会话后自动发送 `读取会话[源会话标题](codex://threads/源会话ID)，继续完成`。支持本机与已登记的 SSH 接入；远端链接保留原主机信息。新会话创建并发送成功后自动打开，源会话保留，名称由 Codex 正常生成。
+在会话列表右键或长按一个支持新建的 Codex App／CLI／IDE／WSL 会话，在“会话详情”下选择 **从会话恢复**。系统读取源会话的标题、实际工作目录及模型设置，在同一接入和主机创建新聊天，再打开它并自动发送 `读取会话[源会话标题](codex://threads/源会话ID)，继续完成`。源会话无需打开或连接；不会停止或修改原任务，也不会复制历史、Goal 或待审批状态。
 
-若新会话已创建但消息明确尚未发送，页面保留待发文本，可选择 **继续恢复** 或 **继续发送**，仍使用同一个新会话。若提示结果尚未确认，先选择 **核对结果**；已知新会话 ID 时也可选择 **打开新会话** 检查。核对不会自动重复创建或发送。无法确认源配置、目录或账号身份时会说明原因，不自动改用默认配置。
+新聊天使用源实际目录，包括已有 worktree 和独立聊天目录；模型、思考强度及已知速度档位按读取到的值传入。权限、审批、提供商和认证等其他设置沿用该接入当前普通新建的默认值。模型未记录时使用新建默认模型并提示，缺失的思考强度或速度参数省略；缺少目录时说明原因，不创建另一工作区。新会话名称由 Codex 正常生成，SSH 引用链接保留原生主机信息。
 
-菜单打开后若外部切换了账号或接入，需要重新打开菜单。恢复支持 Bridge 管理的 API 账号和官方账号兼容配置；原运行环境中的认证 Key 或 API 地址无法核验时，操作会停止并提示核对接入。
+创建成功后，首条消息保存在新聊天的普通草稿中。首发明确未提交或聊天尚未连接时，直接在新聊天继续；消息可能已送达时使用普通消息管理核对。取得的新会话 ID 和同一创建请求的回执保留，不因首发失败重新创建。每次新的明确恢复操作均可再创建一个新聊天，不被同源旧恢复记录阻止。
 
 ## English
 
@@ -47,10 +47,8 @@ If Claude Desktop Code requires workspace trust, open the selected folder in Des
 
 Creation uses the original environment's permissions and account. Existing chats, project settings and connections are not migrated.
 
-Use **Continue in a new chat** directly below **Chat details** in a Codex App or CLI chat menu. It creates a new chat in the source connection and working directory, confirms supported model, reasoning, speed and permission settings, and sends the fixed Chinese reference message automatically. The source chat is retained. A known unsent message can continue in the same new chat; an uncertain result is checked without repeating creation or sending. Reopen the menu after an external account or connection change. Recovery stops if the original environment's authentication key or API route cannot be verified.
-
 ### Continue in a new chat
 
-Right-click or long-press a Codex App or CLI conversation and select **Continue in a new chat** below **Chat details**. The action keeps its connection, host, actual working directory and verifiable model, reasoning, speed and permission settings, then creates an empty conversation and sends `读取会话[Source title](codex://threads/SourceID)，继续完成`. The message remains in Chinese. Local and registered SSH connections are supported; remote links retain the original host. The new conversation opens after successful submission, keeps native automatic naming, and leaves the source conversation intact.
+Right-click or long-press a supported Codex App, CLI, IDE or WSL chat and select **Continue in a new chat** below **Chat details**. Bridge reads its actual working directory and model settings, creates and opens a new chat in the same entry and host, then attempts the fixed continuation message once. The source does not need to be connected. Permissions, approvals, provider and authentication use ordinary creation defaults. Missing reasoning or speed settings are omitted; a missing model uses the creation default with a notice. A missing directory prevents creation.
 
-If the new conversation exists and the message is known to be unsent, the pending text remains available with **Continue recovery** or **Continue sending**, using the same new conversation. For an unconfirmed result, select **Check result** or **Open new chat** when its ID is known. Checking never automatically repeats creation or sending. Unverifiable source settings, directories or account identity produce an explanation instead of silently selecting defaults.
+The first message remains an ordinary draft if sending is not possible. Continue in the new chat, or use ordinary message management when delivery is uncertain. A known new chat ID is retained and a failed first send does not create another chat. New explicit requests may create another chat from the same source.

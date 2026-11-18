@@ -732,6 +732,10 @@ class SessionStore:
                 settings = (payload.get('collaboration_mode') or {}).get('settings') or {}
                 current['params'] = {'model':payload.get('model') or settings.get('model'),
                                      'effort':payload.get('effort') or settings.get('reasoning_effort')}
+                for key in ('service_tier', 'serviceTier'):
+                    if key in payload:
+                        current['params']['serviceTier'] = payload[key]
+                        break
             elif record.get("type") == "event_msg" and payload.get("type") in ("task_complete", "turn_aborted"):
                 if current:
                     current["status"] = "completed" if payload["type"] == "task_complete" else "interrupted"

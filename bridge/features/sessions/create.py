@@ -16,6 +16,8 @@ import uuid
 from pathlib import Path
 from urllib.parse import urlencode
 
+_SERVICE_TIER_UNSET = object()
+
 
 class CreationError(RuntimeError):
     pass
@@ -147,13 +149,14 @@ def independent_directory(data_dir, request_id):
         raise CreationUnavailable('独立聊天目录不可用') from exc
 
 
-def project_directory(value, create=False, expected=None):
-    """Explicit project selection only; return the canonical directory identity."""
+def project_directory(value, create=False, expected=None, *, trim=True):
+    """Validate a directory identity, trimming only paths typed by the user."""
     if not isinstance(value, str) or not value.strip() or len(value) > 4096 or any(ord(c) < 32 for c in value):
         raise ValueError('请输入完整的项目目录')
     if type(create) is not bool:
         raise ValueError('创建目录选项无效')
-    value = value.strip()
+    if trim:
+        value = value.strip()
     # UNC/device paths can initiate remote authentication on Windows. Projects
     # on SSH/WSL must be resolved on that registered host instead.
     if os.name == 'nt' and (value.startswith(('\\\\', '//')) or ':' in value[2:]):
@@ -309,14 +312,20 @@ def _native_project(request, cwd, project):
     raise CreationUnavailable('电脑 App 项目与运行时尚未对应，请检查所用 Codex App 和运行时配置后重试')
 
 
-def model_overrides(model=None, effort=None):
-    if model is None and effort is None:
-        return {}
-    if not isinstance(model, str) or not model or len(model) > 300 or any(c.isspace() or ord(c) < 32 for c in model):
-        raise CreationUnavailable('新会话模型无效')
-    if effort is not None and effort not in ('none', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max', 'ultra'):
-        raise CreationUnavailable('新会话思考强度无效')
-    return {'model': model, **({'config': {'model_reasoning_effort': effort}} if effort is not None else {})}
+def model_overrides(model=None, effort=None, *, service_tier=_SERVICE_TIER_UNSET):
+    result = {}
+    if model is not None or effort is not None:
+        if not isinstance(model, str) or not model or len(model) > 300 or any(c.isspace() or ord(c) < 32 for c in model):
+            raise CreationUnavailable('新会话模型无效')
+        if effort is not None and effort not in ('none', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max', 'ultra'):
+            raise CreationUnavailable('新会话思考强度无效')
+        result = {'model': model, **({'config': {'model_reasoning_effort': effort}} if effort is not None else {})}
+    if service_tier is not _SERVICE_TIER_UNSET:
+        if service_tier is not None and (not isinstance(service_tier, str) or not service_tier or len(service_tier) > 100 or
+                                         any(c.isspace() or ord(c) < 32 for c in service_tier)):
+            raise CreationUnavailable('新会话速度档位无效')
+        result['serviceTier'] = service_tier
+    return result
 
 
 def creation_settings(settings=None, model=None, effort=None):
@@ -445,9 +454,14 @@ def normalize_creation_title(value):
 
 
 def create_empty(executable, codex_home, cwd, title='', project=None, model=None, effort=None, *,
-                 settings=None, on_created=None, on_start=None, isolated_home=False):
+                 settings=None, service_tier=_SERVICE_TIER_UNSET, on_created=None, on_start=None, isolated_home=False):
     title = normalize_creation_title(title)
     overrides = creation_settings(settings, model, effort)
+    if service_tier is not _SERVICE_TIER_UNSET:
+        tier = model_overrides(service_tier=service_tier)['serviceTier']
+        if 'serviceTier' in overrides and overrides['serviceTier'] != tier:
+            raise CreationUnavailable('原会话速度设置与新建参数不一致')
+        overrides['serviceTier'] = tier
     supported = project is not None and _native_project_support(executable, project.get('required', False))
     created_id = None
     def create(request):
@@ -466,6 +480,8 @@ def create_empty(executable, codex_home, cwd, title='', project=None, model=None
             on_created(thread_id)
         if settings is not None:
             verify_creation_settings(result, overrides, cwd, local_windows=os.name == 'nt')
+        if service_tier is not _SERVICE_TIER_UNSET:
+            verify_creation_settings(result, {'serviceTier': service_tier})
         if model is not None and (result.get('model') != model or effort is not None and result.get('reasoningEffort') != effort):
             raise CreationError('聊天已创建，但模型或思考强度尚未确认，请检查原会话；不会重复创建')
         if project_id is not None and result['thread'].get('projectId') != project_id:

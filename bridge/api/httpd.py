@@ -1314,9 +1314,7 @@ class Handler(BaseHTTPRequestHandler):
                     raise ValueError('此接入暂不支持从会话恢复')
                 if write:
                     body = self.read_json()
-                    if (set(body) != {'id', 'sourceContext'} or not isinstance(body['id'], str) or
-                            not isinstance(body['sourceContext'], str) or
-                            not re.fullmatch(r'[0-9a-f]{64}', body['sourceContext'])):
+                    if (set(body) - {'id', 'sourceContext'} or not isinstance(body.get('id'), str)):
                         raise ValueError('从会话恢复请求无效')
                     identifier = body['id']
                 else:

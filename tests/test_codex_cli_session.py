@@ -136,6 +136,36 @@ class CliSessionTests(unittest.TestCase):
         self.assertEqual(caught.exception.created_id, identifier)
         self.assertEqual([method for method, _ in self.fake.sent], ['thread/start'])
 
+    def test_cli_model_creation_preserves_native_defaults_and_copies_or_clears_speed(self):
+        identifier = '20000000-0000-4000-8000-000000000004'
+        self.fake.thread.update(id=identifier, cwd=str(self.home), model='source-model',
+                                reasoningEffort='high')
+        native_request = self.fake.request
+        def request(method, params, **kwargs):
+            if method == 'thread/start':
+                self.fake.sent.append((method, params))
+                return {'thread': self.fake.thread.copy(), 'model': 'source-model',
+                        'reasoningEffort': 'high', 'serviceTier': params.get('serviceTier', 'default'),
+                        'activePermissionProfile': {'id': ':workspace'}, 'approvalPolicy': 'on-request',
+                        'approvalsReviewer': 'user'}
+            return native_request(method, params, **kwargs)
+        self.fake.request = request
+        for index, options in enumerate(({}, {'service_tier': 'fast'}, {'service_tier': None}), 4):
+            with self.subTest(options=options):
+                self.fake.thread['id'] = '20000000-0000-4000-8000-00000000000' + str(index)
+                self.fake.sent.clear()
+                state = self.sessions.create(str(self.home), model='source-model', effort='high', **options)
+                start = self.fake.sent[0][1]
+                self.assertEqual(start['model'], 'source-model')
+                self.assertEqual(start['config'], {'model_reasoning_effort': 'high'})
+                self.assertEqual('serviceTier' in start, bool(options))
+                self.assertEqual(state['latestThreadSettings']['serviceTier'], options.get('service_tier', 'default'))
+                self.assertEqual(state['modelProvider'], 'original-provider')
+                self.assertEqual(state['currentPermissions']['activePermissionProfile']['id'], ':workspace')
+                self.assertFalse(set(start) & {'modelProvider', 'permissions', 'approvalPolicy',
+                                              'approvalsReviewer', 'runtimeWorkspaceRoots'})
+                self.assertEqual([method for method, _ in self.fake.sent], ['thread/start', 'thread/read'])
+
     def test_passive_attach_does_not_connect_or_resume(self):
         self.sessions._start_daemon = Mock()
         Path(self.fake.socket_path).unlink()

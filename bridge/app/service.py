@@ -46,7 +46,7 @@ from bridge.features.sessions.create import (
 from bridge.features.sessions.archive import ArchiveCommands
 from bridge.features.sessions.deletion import DeleteCommands, deletion_scope, delete_native
 from bridge.features.sessions.compaction import CompactCommands
-from bridge.features.sessions.recovery import RecoveryCommands, recovery_settings, recovery_message, verify_recovery_permissions
+from bridge.features.sessions.recovery import RecoveryCommands, recovery_source
 from bridge.features.sessions.cli_release import ReleasedSessions
 from bridge.features.sessions.organization_commands import OrganizationCommands
 from bridge.features.sessions.organization import OrganizationNotSent
@@ -59,7 +59,7 @@ from bridge.features.sessions.tool_images import TOOL_IMAGE_CACHE, public_turns
 from bridge.features.accounts.account import Account
 from bridge.features.accounts.accounts import Accounts, operation
 from bridge.features.accounts.operation_gate import OperationGate
-from bridge.features.accounts.draft_identity import codex_account_identity, codex_configuration_identity, draft_identity
+from bridge.features.accounts.draft_identity import codex_account_identity, draft_identity
 from bridge.features.accounts.cli_access import CliAccess
 from bridge.features.accounts.models import valid_model_id
 from bridge.features.sessions.goal import GoalRPC, GoalError, GoalUnavailable, GoalUnsupported, goal_activation, goal_identity, normalize_goal_result, normalize_ui_locale, goal_command_fingerprint, goal_state_confirms_command, native_goal_absent, normalize_goal, plan_goal_command, read_native_goal
@@ -688,237 +688,110 @@ class Bridge:
 
     def recover(self, thread_id, body=None, *, request_id=None):
         if body is None:
-            result = self.recovery_commands.read(thread_id, request_id, self._recovery_reconcile)
-            if result['status'] == 'idle':
-                metadata = self.store.get(thread_id)
-                if metadata.get('origin') not in ('desktop', 'cli'):
-                    raise ValueError('此会话来源暂不支持从会话恢复')
-                environment = self._recovery_environment(metadata.get('model_provider'), metadata.get('cwd'))
-                result['sourceContext'] = self._recovery_context(thread_id, metadata, environment)
-            return result
-        if (not isinstance(body, dict) or set(body) != {'id', 'sourceContext'} or
-                not isinstance(body['id'], str) or not isinstance(body['sourceContext'], str) or
-                not re.fullmatch(r'[0-9a-f]{64}', body['sourceContext'])):
+            return self.recovery_commands.read(thread_id, request_id)
+        if (not isinstance(body, dict) or set(body) - {'id', 'sourceContext'} or
+                not isinstance(body.get('id'), str)):
             raise ValueError('从会话恢复请求无效')
         return self.recovery_commands.perform(thread_id, body['id'],
-            source_context=body['sourceContext'],
-            prepare=lambda: self._recovery_source(thread_id, body['sourceContext']), create=self._recovery_create,
-            configure=self._recovery_configure,
-            send=lambda entry: self.send(entry['id'], entry['text'], entry['operationId'], _recovery=entry),
-            receipt=self._recovery_receipt, execute=self._run_recovery)
+            prepare=lambda: self._recovery_source(thread_id), create=self._recovery_create,
+            execute=self._run_recovery)
 
     @operation
     def _run_recovery(self, run):
-        # Reserve/deduplicate before the account gate so status reads and rapid
-        # repeat clicks cannot queue behind the original operation's writes.
         return run()
 
-    def _recovery_context(self, thread_id, metadata, environment):
-        return draft_identity('recovery-source-v1', thread_id, self.host, self.native_host,
-                              metadata['origin'], metadata.get('model_provider'), metadata.get('cwd'),
-                              json.dumps(environment, sort_keys=True, separators=(',', ':')))
-
-    def _recovery_environment(self, provider, cwd, expected=None):
-        if self.local:
-            result = {'directory': project_directory(cwd, expected=expected),
-                      'home': str(self.codex_home.resolve()),
-                      'account': codex_account_identity(self.codex_home, provider, shared_auth=True),
-                      'configuration': codex_configuration_identity(self.codex_home, cwd, provider)}
-            alias = None
-        else:
-            alias = self.hosts.hosts().get(self.host, {}).get('alias')
-            if not alias or alias != self.cli_sessions.alias or alias != self.store.alias:
-                raise ValueError('原 SSH 接入已变化，请重新连接原主机')
-            source = source_text('features/sessions/create.py') + '\n' + source_text('features/accounts/draft_identity.py')
-            source += '\nrequest = ' + payload({'cwd': cwd, 'expected': expected, 'provider': provider}) + '\n'
-            source += ('home = Path(os.environ.get("CODEX_HOME", str(Path.home()/".codex"))).resolve()\n'
-                       'print(json.dumps({"directory": project_directory(request["cwd"], expected=request["expected"]), '
-                       '"home": str(home), "account": codex_account_identity(home, request["provider"], shared_auth=True), '
-                       '"configuration": codex_configuration_identity(home, request["cwd"], request["provider"])}))\n')
-            result = ssh_read(alias, source)
-            if self.cli_sessions.remote_home is not None and str(self.cli_sessions.remote_home) != result['home']:
-                raise ValueError('原 SSH Codex 配置目录已变化')
-        if not result.get('account'):
-            raise ValueError('无法确认原接入的账号身份，请先核对 Codex 接入')
-        return {'directoryIdentity': result['directory'],
-                'identity': {'home': result['home'], 'account': result['account'],
-                             'configuration': result['configuration'], 'host': self.host, 'alias': alias}}
-
-    def _recovery_source(self, thread_id, source_context):
-        from bridge.features.sessions.create import creation_settings, verify_creation_settings
+    def _recovery_source(self, thread_id):
         metadata = self.store.get(thread_id)
-        if metadata.get('origin') not in ('desktop', 'cli'):
-            raise ValueError('此会话来源暂不支持从会话恢复')
-        environment = self._recovery_environment(metadata.get('model_provider'), metadata.get('cwd'))
-        if self._recovery_context(thread_id, metadata, environment) != source_context:
-            raise ValueError('源会话接入或账号已变化，请重新打开会话菜单')
-        session = self.session(thread_id, attach=False)
-        with session.condition:
-            state = copy.deepcopy(session.state) if session.connected else None
-            kind = 'cli' if session.runtime == 'cli' or metadata.get('origin') == 'cli' else 'desktop'
+        with self.lock:
+            session = self.live.get(thread_id)
+        state = None
+        if session is not None:
+            with session.condition:
+                if session.connected:
+                    state = {key: copy.deepcopy(session.state[key]) for key in
+                             ('id', 'title', 'cwd', 'latestModel', 'latestReasoningEffort',
+                              'latestThreadSettings', 'serviceTier') if key in (session.state or {})}
+                    from bridge.features.sessions.create import thread_service_tier
+                    missing = object()
+                    tier = thread_service_tier(session.state or {}, missing)
+                    if tier is not missing:
+                        state['serviceTier'] = tier
         if state is None:
-            state = self.store.history(thread_id, turn_limit=1)
-        cwd = state.get('cwd')
-        if (state.get('id') != thread_id or not same_cwd(cwd, metadata.get('cwd'), self.local and os.name == 'nt') or
-                state.get('modelProvider') != metadata.get('model_provider')):
-            raise ValueError('源会话身份已变化，请重新打开会话菜单')
-        settings = creation_settings(recovery_settings(state))
-        try:
-            verify_creation_settings({**state, 'permissions': settings['permissions']}, settings, cwd,
-                                     local_windows=self.local and os.name == 'nt')
-        except CreationError as exc:
-            raise ValueError('源会话设置或权限不一致，尚未创建新会话，请先核对原会话') from exc
-        after_read = self._recovery_environment(settings['modelProvider'], cwd, environment['directoryIdentity'])
-        if after_read['identity'] != environment['identity']:
-            raise ValueError('读取源会话期间接入或账号已变化，尚未创建新会话')
-        return {'cwd': cwd, **environment, 'kind': kind, 'settings': settings,
-                'sandboxPolicy': copy.deepcopy({**(state.get('currentPermissions') or {}),
-                                                **(state.get('latestThreadSettings') or {})}.get('sandboxPolicy')),
-                'text': recovery_message(state.get('title') or metadata.get('title'), thread_id, self.native_host)}
-
-    def _recovery_check(self, entry):
-        source = entry['sourceSnapshot']
-        environment = self._recovery_environment(source['settings']['modelProvider'], source['cwd'],
-                                                 source['directoryIdentity'])
-        if environment['identity'] != source['identity']:
-            raise ValueError('原接入或账号已变化，未继续发送；请核对已创建会话')
-        return source
+            try:
+                state = self.store.history(thread_id, turn_limit=1)
+            except (OSError, StoreUnavailable, RemoteUnavailable):
+                state = {}
+        kind = 'cli' if metadata.get('origin') in ('cli', 'ide') or self.host.startswith('codex:') else 'desktop'
+        return recovery_source(state, metadata, thread_id, self.native_host, kind=kind)
 
     def _recovery_create(self, entry, started, created):
-        source = self._recovery_check(entry)
+        source = entry['sourceSnapshot']
+        options = source['modelOptions']
+        overrides = {key: options[key] for key in ('model', 'effort') if key in options}
+        if 'serviceTier' in options:
+            overrides['service_tier'] = options['serviceTier']
+        if not self.local:
+            alias = self.hosts.hosts().get(self.host, {}).get('alias')
+            if not alias or alias != self.cli_sessions.alias or alias != self.store.alias:
+                raise ValueError('原 SSH 主机配置已变化，请重新连接原主机')
         if source['kind'] == 'cli':
-            state = self.cli_sessions.create(source['cwd'], settings=source['settings'],
-                                             on_start=started, on_created=created)
-            from bridge.features.sessions.create import verify_creation_settings
+            state = self.cli_sessions.create(source['cwd'], on_start=started, on_created=created, **overrides)
             with self.cli_sessions.require_current(state['id']) as current:
-                verify_creation_settings(current, source['settings'], source['cwd'],
-                                         local_windows=self.local and os.name == 'nt')
                 self._install_created_cli_session(current, cwd=source['cwd'])
-        elif self.local:
+            return {'opened': False, 'message': '新聊天已创建',
+                    'draftAccountIdentity': self._creation_draft_identity(entry['id'])}
+        if self.local:
             create_empty(self.catalog_reader.executable, self.codex_home, source['cwd'],
-                         settings=source['settings'], on_start=started, on_created=created,
-                         **_runtime_scope(self.host))
+                         on_start=started, on_created=created, **overrides, **_runtime_scope(self.host))
         else:
-            script = source_text('features/sessions/create.py') + '\n' + source_text('features/accounts/draft_identity.py')
-            script += '\nimport shutil\nrequest = ' + payload(source) + '\n'
-            script += '''reply = {'started': False, 'id': None}
+            script = source_text('features/sessions/create.py')
+            script += '\nimport shutil\nrequest = ' + payload({'cwd': source['cwd'], 'options': overrides}) + '\n'
+            script += """reply = {'started': False, 'id': None}
 def started():
     reply['started'] = True
 def created(identifier):
     reply['id'] = identifier
 try:
     home = Path(os.environ.get('CODEX_HOME', str(Path.home()/'.codex'))).resolve()
-    expected = request['identity']
-    if (str(home) != expected['home'] or
-        codex_account_identity(home, request['settings']['modelProvider'], shared_auth=True) != expected['account'] or
-        codex_configuration_identity(home, request['cwd'], request['settings']['modelProvider']) != expected['configuration']):
-        raise ValueError('原 SSH 接入或账号已变化，未创建新会话')
-    project_directory(request['cwd'], expected=request['directoryIdentity'])
     runtime = shutil.which('codex') or str(Path.home()/'.local/bin/codex')
-    create_empty(runtime, home, request['cwd'], settings=request['settings'], on_start=started, on_created=created)
+    create_empty(runtime, home, request['cwd'], on_start=started, on_created=created, **request['options'])
 except Exception as error:
     reply['error'] = str(error)
 print(json.dumps(reply, ensure_ascii=False))
-'''
-            # A transport failure may hide a remote write; only an explicit
-            # pre-start remote reply can release that uncertainty.
+"""
             started()
-            reply = ssh_read(source['identity']['alias'], script, timeout=90)
+            reply = ssh_read(alias, script, timeout=90)
             if not reply.get('started') and not reply.get('id'):
                 started(False)
             if reply.get('id'):
                 created(reply['id'])
             if reply.get('error') or not reply.get('id'):
-                raise CreationError(reply.get('error') or 'SSH 创建结果尚未确认，请核对原主机')
+                raise CreationError(reply.get('error') or '创建结果尚未确认，请检查聊天列表')
+        try:
+            open_in_desktop(entry['id'], self.native_host)
+            entry['opened'] = True
+        except (OSError, CreationError, subprocess.SubprocessError):
+            entry['opened'] = False
+        if options:
+            entry['modelOptions'] = options
+            entry['modelSettingsPhase'] = 'pending'
+            self._save_creations()
+            self._complete_creation_settings(entry, self, from_source=True)
+        return {'opened': entry['opened'], 'message': '新聊天已创建',
+                'draftAccountIdentity': self._creation_draft_identity(entry['id'])}
 
-    def _recovery_configure(self, entry, started):
-        from bridge.features.sessions.create import verify_creation_settings
-        source = self._recovery_check(entry)
-        if source['kind'] == 'desktop':
-            with self.lock:
-                live = self.live.get(entry['id'])
-            if live is None or not live.connected:
-                open_in_desktop(entry['id'], self.native_host)
-        session = self._target(entry['id'])
-        with session.action_lock:
+    def _creation_draft_identity(self, thread_id):
+        with self.lock:
+            session = self.live.get(thread_id)
+        if session is not None:
             with session.condition:
-                state = copy.deepcopy(session.state or {})
-                if (session.runtime != source['kind'] or state.get('id') != entry['id'] or
-                        not same_cwd(source['cwd'], state.get('cwd'), self.local and os.name == 'nt') or
-                        state.get('modelProvider') != source['settings']['modelProvider']):
-                    raise ValueError('新会话身份尚未确认，未发送消息')
-                if ordered_turns(state) or state.get('threadRuntimeStatus', {}).get('type') != 'idle':
-                    raise ValueError('新会话已有内容或正在运行，请在该会话核对消息')
+                provider = (session.state or {}).get('modelProvider') or session.saved_provider
+        else:
             try:
-                verify_creation_settings(state, source['settings'], source['cwd'],
-                                         local_windows=self.local and os.name == 'nt')
-                verify_recovery_permissions(state, source)
-                return
-            except CreationError:
-                if entry.get('settingsStarted'):
-                    raise
-            settings = source['settings']
-            change = {key: settings[key] for key in
-                      ('model', 'serviceTier', 'permissions', 'approvalPolicy', 'approvalsReviewer', 'runtimeWorkspaceRoots')
-                      if key in settings}
-            if 'config' in settings:
-                change['effort'] = settings['config']['model_reasoning_effort']
-            if source['kind'] == 'cli':
-                raise ValueError('CLI 创建设置尚未确认，请在新会话核对设置')
-            self._recovery_check(entry)
-            started()
-            self._call(session, 'thread-follower-update-thread-settings', {'threadSettings': change})
-            with session.condition:
-                def confirmed():
-                    try:
-                        verify_creation_settings(session.state or {}, settings, source['cwd'],
-                                                 local_windows=self.local and os.name == 'nt')
-                        verify_recovery_permissions(session.state or {}, source)
-                        return True
-                    except (CreationError, ValueError):
-                        return False
-                if not session.condition.wait_for(confirmed, timeout=5):
-                    raise CreationError('新会话设置结果尚未确认，请核对；不会重复提交')
-
-    def _recovery_receipt(self, entry):
-        with self.submit_lock:
-            return (self.submissions.get(entry['id'] + ':' + entry['operationId']) or {}).get('status')
-
-    def _recovery_reconcile(self, entry):
-        if entry['phase'] in ('creating', 'settings') and entry.get('id'):
-            from bridge.features.sessions.create import verify_creation_settings
-            try:
-                source = self._recovery_check(entry)
-                with self.lock:
-                    session = self.live.get(entry['id'])
-                state = None
-                if session is not None:
-                    with session.condition:
-                        if session.connected:
-                            state = copy.deepcopy(session.state)
-                if state is None:
-                    state = self.store.history(entry['id'], turn_limit=1)
-                if state.get('id') != entry['id']:
-                    return None
-                verify_creation_settings(state, source['settings'], source['cwd'],
-                                         local_windows=self.local and os.name == 'nt')
-                verify_recovery_permissions(state, source)
-                return {'status': 'not_submitted', 'phase': 'settings',
-                        'message': '新会话设置已核对，消息尚未发送，可继续发送'}
-            except (OSError, ValueError, StoreUnavailable, IPCError, CreationError, RemoteUnavailable):
-                return None
-        if entry['phase'] == 'sending' and entry.get('id'):
-            try:
-                session = self.session(entry['id'], attach=False)
-                saved = self.store.history(entry['id'], turn_limit=2)
-                with session.condition:
-                    session.set_history(saved)
-                self._reconcile_submissions(session)
-            except (OSError, ValueError, StoreUnavailable, IPCError):
-                pass
-            if self._recovery_receipt(entry) == 'accepted':
-                return {'status': 'confirmed', 'phase': 'complete', 'message': '已创建新会话并发送'}
-        return None
+                provider = self.store.get(thread_id).get('model_provider')
+            except (OSError, ValueError, StoreUnavailable, RemoteUnavailable, KeyError):
+                return ''
+        return self._draft_account_identity({'provider': provider})
 
     def project_host(self, key):
         if not isinstance(key, str):
@@ -1358,19 +1231,26 @@ print(json.dumps(reply, ensure_ascii=False))
             session.changed()
         return session
 
-    def _complete_creation_settings(self, entry, bridge):
-        # An empty thread's temporary creator does not own Desktop's composer.
-        # Complete the explicit creation through that original owner, never from
-        # passive history/attachment or by overriding the account's defaults.
+    def _complete_creation_settings(self, entry, bridge, *, from_source=False):
+        # The App owns its composer after creation. Apply only the explicit
+        # model parameters through that same owner, leaving permissions alone.
         phase = entry.get('modelSettingsPhase')
         if phase not in ('pending', 'unknown'):
             return
         try:
             session = bridge._target(entry['id'])
         except (IPCError, StoreUnavailable) as exc:
-            raise CreationError('聊天已创建，所选模型尚未应用；请重试本次创建以继续连接同一聊天，不会重复创建') from exc
+            raise CreationError('聊天已创建，所选模型尚未应用；请在新聊天中确认模型') from exc
         choice = entry['modelOptions']
-        effort = choice.get('effort')
+        model, effort = choice.get('model'), choice.get('effort')
+        from bridge.features.sessions.create import thread_service_tier
+        missing = object()
+
+        def confirmed(state):
+            return ((model is None or state.get('latestModel') == model) and
+                    (effort is None or session.view().get('effort') == effort) and
+                    ('serviceTier' not in choice or thread_service_tier(state, missing) == choice['serviceTier']))
+
         with session.action_lock:
             with session.condition:
                 state = session.state or {}
@@ -1379,29 +1259,25 @@ print(json.dumps(reply, ensure_ascii=False))
                         not same_cwd(expected_cwd, state.get('cwd'), bridge.local and os.name == 'nt') or
                         not state.get('modelProvider') or
                         session.saved_provider and session.saved_provider != state['modelProvider']):
-                    raise CreationError('聊天已创建，但原桌面会话身份尚未确认；请重新连接同一聊天，不要重复创建')
-                confirmed = state.get('latestModel') == choice['model'] and (effort is None or session.view().get('effort') == effort)
-                if not confirmed and phase == 'unknown':
+                    raise CreationError('聊天已创建，但桌面连接尚未确认；请重新连接新聊天')
+                matches = confirmed(state)
+                if not matches and phase == 'unknown':
                     raise CreationError('聊天已创建，但此前模型设置结果仍待核对；请在该聊天确认模型，不会重复提交')
-                if not confirmed and (ordered_turns(state) or
-                        state.get('threadRuntimeStatus', {}).get('type') != 'idle'):
+                if not matches and (ordered_turns(state) or state.get('threadRuntimeStatus', {}).get('type') != 'idle'):
                     raise CreationError('聊天已有内容或正在运行，未覆盖原生模型设置；请在该聊天确认模型')
-            if not confirmed:
+            if not matches:
                 entry['modelSettingsPhase'] = 'unknown'
                 self._save_creations()
                 try:
-                    if effort is not None:
-                        result = bridge._apply_settings(session, choice['model'], effort)
+                    if not from_source and model is not None and effort is not None and 'serviceTier' not in choice:
+                        result = bridge._apply_settings(session, model, effort)
                     else:
-                        # API catalogs can explicitly omit reasoning controls.
-                        # Preserve native effort rather than inventing a default.
-                        result = bridge._call(session, 'thread-follower-update-thread-settings',
-                                              {'threadSettings': {'model': choice['model']}})
+                        change = {key: choice[key] for key in ('model', 'effort', 'serviceTier') if key in choice}
+                        result = bridge._call(session, 'thread-follower-update-thread-settings', {'threadSettings': change})
                         with session.condition:
                             result['confirmed'] = bool(result.get('applied')) and session.condition.wait_for(
-                                lambda: session.state.get('latestModel') == choice['model'], timeout=5)
+                                lambda: confirmed(session.state or {}), timeout=5)
                 except ValueError as exc:
-                    # Model/catalog validation rejects before dispatching a write.
                     entry['modelSettingsPhase'] = 'pending'
                     self._save_creations()
                     raise CreationError('聊天已创建，所选模型尚未应用：' + str(exc)) from exc
@@ -1798,6 +1674,7 @@ print(json.dumps(reply, ensure_ascii=False))
                 if not session or session.runtime != 'cli' else session.native_goal_supported is True)
         return {'source': origin, 'runtime': (session.runtime if connected else None),
                 'readOnly': not writable, 'canSend': writable, 'canInterrupt': writable,
+                'canRecover': origin in ('desktop', 'cli', 'ide'),
                 'canApprove': writable, 'canReconnect': reconnect,
                 'canConfigure': desktop_controls, 'canChangePermissions': desktop or cli_controls,
                 'canChangeModel': desktop or cli_controls,
@@ -4111,7 +3988,7 @@ print(json.dumps(reply, ensure_ascii=False))
     @operation
     def send(self, thread_id, text, submission_id, mode="send", skills=None, *, work_mode=None,
              plan_response=None, attachments=None, references=None, ui_locale=None, activation=None,
-             _async_response=None, _recovery=None):
+             _async_response=None):
         uuid.UUID(submission_id)
         identifiers = [] if attachments is None else attachments
         files = self.uploads.resolve(thread_id, identifiers)
@@ -4175,15 +4052,6 @@ print(json.dumps(reply, ensure_ascii=False))
                             prior.get("goalActivation") != activation):
                         raise ValueError("同一消息标识不能用于不同内容")
                     return {"status": prior["status"], "duplicate": True, "id": submission_id}
-            if _recovery is not None:
-                from bridge.features.sessions.create import verify_creation_settings
-                source = self._recovery_check(_recovery)
-                with session.condition:
-                    if session.runtime != source['kind'] or ordered_turns(session.state or {}):
-                        raise SubmissionRejected('新会话已有内容或接入已变化，尚未发送，请先核对')
-                    verify_creation_settings(session.state or {}, source['settings'], source['cwd'],
-                                             local_windows=self.local and os.name == 'nt')
-                    verify_recovery_permissions(session.state or {}, source)
             with session.condition:
                 if _async_response is not None:
                     request_id, response = _async_response

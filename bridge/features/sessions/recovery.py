@@ -1,4 +1,4 @@
-"""Create-and-send recovery receipts, kept in the existing creation ledger."""
+"""Prepare an ordinary new chat from a source chat's directory and model."""
 import copy
 import re
 import uuid
@@ -6,35 +6,21 @@ from urllib.parse import quote
 from bridge.features.sessions.create import thread_service_tier
 
 
-def recovery_settings(state):
+def recovery_settings(state, metadata=None):
+    """Copy known model parameters; every other setting keeps its new-chat default."""
+    metadata = metadata or {}
     latest = state.get('latestThreadSettings') or {}
-    settings = {'modelProvider': state.get('modelProvider'),
-                'model': latest.get('model') or state.get('latestModel')}
-    if not all(isinstance(value, str) and value for value in settings.values()):
-        raise ValueError('尚未取得源会话的模型配置，请先核对原会话')
-    effort = latest.get('effort', state.get('latestReasoningEffort'))
-    if effort is not None:
-        settings['config'] = {'model_reasoning_effort': effort}
+    model = latest.get('model') or state.get('latestModel') or metadata.get('model')
+    settings = {}
+    if model:
+        settings['model'] = model
+        effort = latest.get('effort', state.get('latestReasoningEffort'))
+        if effort is not None:
+            settings['effort'] = effort
     missing = object()
     tier = thread_service_tier(state, missing)
     if tier is not missing:
         settings['serviceTier'] = tier
-    permissions = {**(state.get('currentPermissions') or {}), **latest}
-    profile = permissions.get('activePermissionProfile') or {}
-    permission = profile.get('id')
-    if not permission:
-        policy = permissions.get('sandboxPolicy') or {}
-        # Only exact built-in profiles can be inferred from a saved policy.
-        permission = {'dangerFullAccess': ':danger-full-access',
-                      'danger-full-access': ':danger-full-access'}.get(policy.get('type'))
-        if policy.get('type') in ('workspaceWrite', 'workspace-write'):
-            raise ValueError('源会话未提供可核验的工作区权限配置，请先核对原会话')
-    if not permission or 'approvalPolicy' not in permissions or 'approvalsReviewer' not in permissions:
-        raise ValueError('尚未取得源会话的完整权限配置，请先核对原会话')
-    settings.update(permissions=permission, approvalPolicy=permissions['approvalPolicy'],
-                    approvalsReviewer=permissions['approvalsReviewer'])
-    if 'runtimeWorkspaceRoots' in permissions:
-        settings['runtimeWorkspaceRoots'] = copy.deepcopy(permissions['runtimeWorkspaceRoots'])
     return settings
 
 
@@ -48,75 +34,70 @@ def recovery_message(title, source_id, host):
     return '读取会话[' + label + '](' + link + ')，继续完成'
 
 
-def verify_recovery_permissions(state, source):
-    expected = source.get('sandboxPolicy')
-    if expected is not None:
-        permissions = {**(state.get('currentPermissions') or {}), **(state.get('latestThreadSettings') or {})}
-        if permissions.get('sandboxPolicy') != expected:
-            raise ValueError('新会话的实际工作区或网络权限与源会话不一致，尚未发送，请先核对')
+def recovery_source(state, metadata, source_id, host, *, kind):
+    """Resolve only server-owned source information, without attaching its runtime."""
+    uuid.UUID(source_id)
+    cwd = (state or {}).get('cwd') or metadata.get('cwd')
+    if not isinstance(cwd, str) or not cwd:
+        raise ValueError('源会话未记录工作目录，无法新建聊天')
+    options = recovery_settings(state or {}, metadata)
+    result = {'cwd': cwd, 'kind': kind, 'modelOptions': options,
+              'text': recovery_message((state or {}).get('title') or metadata.get('title'), source_id, host)}
+    if 'model' not in options:
+        result['warning'] = '源会话未记录模型，已使用新聊天的默认模型'
+    return result
 
 
 class RecoveryCommands:
+    """Keep the ordinary creation ID; sending belongs to the target chat's composer."""
     def __init__(self, entries, lock, save, host):
         self.entries, self.lock, self.save, self.host = entries, lock, save, host
-        self.active = set()
         for entry in entries.values():
-            if entry.get('recoverySource') and entry.get('status') == 'running':
-                entry.update(status='failed' if entry['phase'] == 'validating' else 'unknown',
-                             message='上次操作中断，请核对已创建会话；不会自动重复提交')
+            if entry.get('recoverySource') and entry.get('status') in ('running', 'creating'):
+                entry.update(status='unknown' if entry.get('createStarted') or entry.get('id') else 'failed',
+                             ready=False, message='上次创建结果尚未确认，请检查聊天列表；不会重复创建')
 
     def _public(self, entry):
         if entry is None:
-            return {'operationId': None, 'status': 'idle', 'id': None, 'host': self.host}
-        return {key: copy.deepcopy(entry.get(key)) for key in
-                ('operationId', 'status', 'phase', 'id', 'host', 'message', 'text', 'sourceContext')}
+            return {'operationId': None, 'status': 'idle', 'id': None, 'host': self.host, 'ready': False}
+        result = {key: copy.deepcopy(entry.get(key)) for key in
+                  ('operationId', 'status', 'id', 'host', 'text', 'ready', 'opened', 'message',
+                   'warning', 'draftAccountIdentity')}
+        # Older operations may already have sent. Never use a read of them to
+        # schedule a new first message or rewrite their inherited settings.
+        if entry.get('recoveryVersion') != 2:
+            result['ready'] = False
+            if result.get('id'):
+                result['status'] = 'created'
+            if entry.get('phase') == 'sending' or entry.get('status') == 'confirmed':
+                result['text'] = ''
+        return result
 
     def _find(self, source_id, request_id):
-        if request_id:
-            uuid.UUID(request_id)
-            entry = self.entries.get(request_id)
-            if entry and entry.get('recoverySource') != source_id:
-                raise ValueError('同一操作标识不能用于不同会话或操作')
-            return entry
-        return next((entry for entry in reversed(list(self.entries.values()))
-                     if entry.get('recoverySource') == source_id and
-                     entry.get('status') in ('running', 'unknown', 'not_submitted')), None)
+        if request_id is None:
+            return None
+        uuid.UUID(request_id)
+        entry = self.entries.get(request_id)
+        if entry is not None and entry.get('recoverySource') != source_id:
+            raise ValueError('同一创建请求不能用于不同会话或操作')
+        return entry
 
-    def read(self, source_id, request_id=None, reconcile=None):
+    def read(self, source_id, request_id=None):
         uuid.UUID(source_id)
         with self.lock:
-            entry = self._find(source_id, request_id)
-            snapshot = copy.deepcopy(entry)
-        if snapshot and snapshot['status'] == 'unknown' and reconcile:
-            updates = reconcile(snapshot)
-            if updates:
-                with self.lock:
-                    if entry['status'] == 'unknown' and entry['operationId'] not in self.active:
-                        entry.update(updates)
-                        self.save()
-        with self.lock:
-            return self._public(entry)
+            return self._public(self._find(source_id, request_id))
 
-    def perform(self, source_id, request_id, *, source_context, prepare, create, configure, send, receipt, execute):
+    def perform(self, source_id, request_id, *, prepare, create, execute=None):
         uuid.UUID(source_id)
         uuid.UUID(request_id)
         with self.lock:
             entry = self._find(source_id, request_id)
-            if entry is None:
-                entry = self._find(source_id, None)
-            if entry is not None and entry.get('sourceContext') != source_context:
-                raise ValueError('同一恢复操作不能使用不同的源接入或账号身份')
-            if entry is not None and (entry['operationId'] in self.active or
-                                      entry['status'] in ('confirmed', 'unknown', 'failed')):
+            if entry is not None:
                 return self._public(entry)
-            if entry is None:
-                entry = {'recoverySource': source_id, 'operationId': request_id, 'id': None,
-                         'sourceContext': source_context,
-                         'host': self.host, 'status': 'running', 'phase': 'validating',
-                         'message': '正在读取源会话设置…', 'title': '', 'project': None}
-                self.entries[request_id] = entry
-            identifier = entry['operationId']
-            self.active.add(identifier)
+            entry = {'recoverySource': source_id, 'recoveryVersion': 2, 'operationId': request_id,
+                     'id': None, 'host': self.host, 'status': 'creating', 'phase': 'validating',
+                     'ready': False, 'title': '', 'project': None}
+            self.entries[request_id] = entry
             self.save()
 
         def update(**values):
@@ -124,45 +105,26 @@ class RecoveryCommands:
                 entry.update(values)
                 self.save()
 
-        def created(sid):
-            uuid.UUID(sid)
-            if sid == source_id:
+        def started(value=True):
+            update(createStarted=value)
+
+        def created(identifier):
+            uuid.UUID(identifier)
+            if identifier == source_id:
                 raise ValueError('新会话身份与源会话相同，未继续操作')
-            update(id=sid)
+            update(id=identifier)
 
         def run():
-            if not entry.get('sourceSnapshot'):
-                snapshot = prepare()
-                update(sourceSnapshot=snapshot, cwd=snapshot['cwd'], kind=snapshot['kind'],
-                       text=snapshot['text'])
-            if not entry.get('id'):
-                update(status='running', phase='creating', message='正在创建…')
-                create(entry, lambda value=True: update(createStarted=value), created)
-                update(createConfirmed=True)
-            update(status='running', phase='settings', message='正在确认会话设置…')
-            configure(entry, lambda: update(settingsStarted=True))
-            update(settingsConfirmed=True, phase='sending', message='正在发送…')
-            result = send(entry)
-            accepted = result.get('status') == 'accepted'
-            update(status='confirmed' if accepted else 'unknown',
-                   phase='complete' if accepted else 'sending',
-                   message='已创建新会话并发送' if accepted else '发送结果尚未确认，请核对新会话；不会重复发送')
+            source = prepare()
+            update(sourceSnapshot=source, cwd=source['cwd'], kind=source['kind'], text=source['text'],
+                   warning=source.get('warning'), phase='creating')
+            result = create(entry, started, created)
+            update(**{'status': 'created', 'ready': True, 'phase': 'complete', **(result or {})})
 
         try:
-            execute(run)
+            (execute or (lambda action: action()))(run)
         except Exception as error:
-            phase = entry['phase']
-            status = 'failed'
-            if phase == 'creating':
-                status = 'unknown' if entry.get('createStarted') else 'failed'
-            elif phase == 'settings':
-                status = 'unknown' if entry.get('settingsStarted') else 'not_submitted'
-            elif phase == 'sending':
-                outcome = receipt(entry)
-                status = 'confirmed' if outcome == 'accepted' else 'unknown' if outcome else 'not_submitted'
-            update(status=status, message=str(error), **({'phase': 'complete'} if status == 'confirmed' else {}))
-        finally:
-            with self.lock:
-                self.active.discard(identifier)
+            status = 'created' if entry.get('id') else 'unknown' if entry.get('createStarted') else 'failed'
+            update(status=status, ready=False, message=str(error))
         with self.lock:
             return self._public(entry)

@@ -188,15 +188,20 @@ class CliCreationCompletionTests(unittest.TestCase):
     def test_recovery_installs_fresh_cli_thread_before_inventory_is_written(self):
         from test_cli_empty_creation import CliEmptyCreationTests
         fixture = CliEmptyCreationTests.fixture(self)
-        source = {'kind': 'cli', 'cwd': str(fixture.native.home),
-                  'settings': {'modelProvider': 'fixture-provider', 'model': 'fixture-model'}}
-        started, created = [], []
-        with patch.object(fixture.owner, '_recovery_check', return_value=source):
-            fixture.owner._recovery_create({}, lambda: started.append(True), created.append)
-        self.assertEqual(started, [True])
-        self.assertEqual(len(created), 1)
-        self.assertNotIn(created[0], fixture.native.persisted)
-        self.assertTrue(fixture.owner.view(created[0], attach=False)['access']['canSend'])
+        source = str(uuid.uuid4())
+        fixture.native.threads[source] = {'id': source, 'cwd': str(fixture.native.home),
+            'modelProvider': 'fixture-provider', 'model': 'fixture-model', 'name': None,
+            'preview': 'Existing task', 'turns': [], 'status': {'type': 'idle'}}
+        fixture.native.persisted.add(source)
+        original_history = fixture.owner.store.history
+        fixture.owner.store.history = lambda sid, **kwargs: {
+            **original_history(sid, **kwargs), 'latestModel': 'fixture-model'}
+        result = fixture.owner.recover(source, {'id': str(uuid.uuid4())})
+        self.assertEqual(result['status'], 'created', result)
+        self.assertTrue(result['ready'], result)
+        self.assertNotEqual(result['id'], source)
+        self.assertNotIn(result['id'], fixture.native.persisted)
+        self.assertTrue(fixture.owner.view(result['id'], attach=False)['access']['canSend'])
         self.assertEqual(self.methods(fixture).count('thread/start'), 1)
         self.assertNotIn('turn/start', self.methods(fixture))
 

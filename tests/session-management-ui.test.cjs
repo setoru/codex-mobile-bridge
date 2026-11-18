@@ -2,240 +2,252 @@
 const test=require('node:test'),assert=require('node:assert/strict'),fs=require('node:fs'),vm=require('node:vm'),path=require('node:path');
 const source=fs.readFileSync(path.join(__dirname,'../web/shell/app.js'),'utf8');
 const code=source.slice(source.indexOf('function renderList(){'),source.indexOf('async function loadList('));
-const sourceContext='a'.repeat(64);
-function fixture(){
- const nodes=new Map(),timers=new Map(),requests=[],dialogs=[],copies=[],opened=[],notices=[],storage=new Map();let timer=0;
- const node=(tag='',cls='',textContent='')=>({tag,cls,textContent,dataset:{},classList:{add(){}},children:[],events:{},scrollTop:0,isConnected:true,append(...items){this.children.push(...items);},replaceChildren(...items){this.children=items;},addEventListener(name,run){this.events[name]=run;},setAttribute(){},focus(){this.focused=true;},showModal(){this.open=true;},close(){this.open=false;this.events.close?.();},remove(){this.isConnected=false;}});
+const {ComposerDrafts}=require('../web/features/chat/composer-drafts.js');
+function fixture(storage=new Map()){
+ const nodes=new Map(),timers=new Map(),requests=[],dialogs=[],copies=[],opened=[],notices=[];let timer=0,sequence=0;
+ const node=(tag='',cls='',textContent='')=>{const classes=new Set();return {tag,cls,textContent,value:'',selectionStart:0,selectionEnd:0,dataset:{},classList:{add(...values){values.forEach(value=>classes.add(value));},remove(...values){values.forEach(value=>classes.delete(value));},contains:value=>classes.has(value),toggle(value,on){if(on===false)classes.delete(value);else classes.add(value);}},children:[],events:{},scrollTop:0,isConnected:true,append(...items){this.children.push(...items);},replaceChildren(...items){this.children=items;},addEventListener(name,run){this.events[name]=run;},setAttribute(){},setSelectionRange(start,end){this.selectionStart=start;this.selectionEnd=end;},focus(){this.focused=true;},showModal(){this.open=true;},close(){this.open=false;this.events.close?.();},remove(){this.isConnected=false;}};};
  const $=id=>{if(!nodes.has(id))nodes.set(id,node());return nodes.get(id);};$('list-mode').value='recent';
- const context=vm.createContext({CliConnectionsPanel:class{},$,el:node,window:{BridgeSessionLinks:{text:identity=>'codex://threads/'+identity.id}},document:{body:{append:box=>dialogs.push(box)}},SessionMenu:class{constructor(){}bind(button,context){button.menuContext=context;}},
-   BridgeClipboard:{copyWithFeedback:async(get,item)=>{if(item.disabled)return;copies.push(get());}},BridgeI18n:{locale:()=> 'en-US'},t:s=>s,localStorage:{getItem:key=>storage.get(key)??null,setItem:(key,value)=>storage.set(key,value)},
-   workbench:{},listIdentity:'gateway',selectedCodexEntry:null,codexActiveAccountId:'account',chatOpenGeneration:0,csrf:'token',clientNavigation:{provider:'codex',clients:[]},state:null,listRows:[],currentId:null,currentHost:'local',listHasMore:false,listRenderStamp:'',listComplete:true,listReadFinished:true,availableSources:[],
-   renderActivity(){},sessionAccess:v=>({source:'desktop',canConfigure:true,canEditMessages:true,...v}),sourceLabel:()=> 'APP',dateText:()=>'',toast:text=>notices.push(text),pinRow:row=>row,sessionPins:{value:(_identity,pinned)=>!!pinned,set(identity,pinned){requests.push({url:`/${identity.host}/${identity.id}/pin`,body:{pinned}});}},desktopSessions:{refresh:async()=>{}},openChat:async(id,host)=>opened.push({id,host}),
-   sessionStorage:{getItem:key=>storage.get(key)??null,setItem:(key,value)=>storage.set(key,value),removeItem:key=>storage.delete(key)},
-   setTimeout:fn=>{timers.set(++timer,fn);return timer;},clearTimeout:id=>timers.delete(id),uuid:()=> 'request-id',
-   api:async(url,body)=>{requests.push({url,body});return {status:'confirmed',sourceContext};},sessionUrl:(id,action,host)=>`/${host}/${id}/${action}`,loadList:async()=>{}});
+ const memory={getItem:key=>storage.get(key)??null,setItem:(key,value)=>storage.set(key,String(value)),removeItem:key=>storage.delete(key)};
+ const drafts=new ComposerDrafts(memory,{});drafts.coordinate=async update=>update(true);
+ const scope=(id,host='local')=>({gateway:'gateway',provider:'codex',account:'account',host,session:id});
+ const text='读取会话[示例](codex://threads/source)，继续完成';
+ const context=vm.createContext({CliConnectionsPanel:class{},$,el:node,window:{BridgeSessionLinks:{text:identity=>'codex://threads/'+identity.id},BridgePresentation:{resizeMessage(){},showError(){}}},document:{hidden:false,body:{append:box=>dialogs.push(box)}},SessionMenu:class{constructor(){}bind(button,context){button.menuContext=context;}},
+   BridgeClipboard:{copyWithFeedback:async(get,item)=>{if(item.disabled)return;copies.push(get());}},BridgeI18n:{locale:()=> 'en-US'},t:s=>s,localStorage:memory,
+   workbench:{cancelLocate(){},rememberScroll(){},stopThumbnails(){}},browserNavigation:{sync:()=>true},listIdentity:'gateway',selectedCodexEntry:null,codexActiveAccountId:'account',chatOpenGeneration:0,csrf:'token',clientNavigation:{provider:'codex',clients:[]},state:null,listRows:[],currentId:null,currentHost:'local',listHasMore:false,listRenderStamp:'',listComplete:true,listReadFinished:true,availableSources:[],
+   renderActivity(){},sessionAccess:v=>({source:'desktop',canRecover:true,canConfigure:true,canEditMessages:true,...v}),sourceLabel:()=> 'APP',dateText:()=>'',toast:text=>notices.push(text),pinRow:row=>row,sessionPins:{value:(_identity,pinned)=>!!pinned,set(identity,pinned){requests.push({url:`/${identity.host}/${identity.id}/pin`,body:{pinned}});}},desktopSessions:{refresh:async()=>{},onListEnter(){}},openDraftAccount:'account',openChat:async(id,host)=>{opened.push({id,host});context.currentId=id;context.currentHost=host;context.chatOpenGeneration++;context.state={id,host,connected:true,access:{canSend:true}};context.codexDraftScope=null;context.codexDraftTouched=false;$('message').value='';$('app').classList.add('chat-open');context.bindCodexDraft({draftAccountIdentity:context.openDraftAccount});},
+   sessionStorage:memory,
+   setTimeout:fn=>{timers.set(++timer,fn);return timer;},clearTimeout:id=>timers.delete(id),uuid:()=>++sequence===1?'request-id':'request-'+sequence,
+   draftGateway:'gateway',composerDrafts:drafts,codexDraftScope:null,codexDraftTouched:false,codexProvisionalDrafts:new Map(),restoringComposer:false,
+   codexQuotes:null,selectedSkills:new Set(),invalidSkills:new Set(),sending:false,chatKey:(id=context.currentId,host=context.currentHost)=>host+'|'+id,
+   attachments:{rows:[],ready:()=>true,ids:()=>[],references:()=>[],setLocked(){},clear(){}},workModes:{selection:'default',value:()=>context.workModes.selection||'default',render(){},submitted(){}},
+   currentAccess:()=>({canSend:true}),bumpRecency(){},renderQueue(){},renderSkillPills(){},messageManagement:null,
+   api:async(url,body)=>{requests.push({url,body});return {status:'confirmed'};},sessionUrl:(id,action,host)=>`/${host}/${id}/${action}`,loadList:async()=>{}});
  context.ClientIdentity=require('../web/features/clients/client-lifecycle.js').ClientIdentity;context.URLSearchParams=URLSearchParams;
  vm.runInContext(code,context);
+ vm.runInContext(source.slice(source.indexOf('function saveDraft(){'),source.indexOf('let catalogStarted=')),context);
+ vm.runInContext(source.slice(source.indexOf('function visibleChat(){'),source.indexOf('\n',source.indexOf('function visibleChat(){'))),context);
+ vm.runInContext(source.slice(source.indexOf("$('back').onclick="),source.indexOf('function applyEntryCapabilities(')),context);
+ vm.runInContext(source.slice(source.indexOf("$('composer').onsubmit=async event=>{"),source.indexOf("$('message').onkeydown=")),context);
+ $('send-mode').value='send';
  const row=(id,recency,pinned=false)=>({id,host:'local',title:id,projectKey:'p',projectName:'Project',hostLabel:'Local',recency,bridgePinned:pinned,access:{}});
- return {context,$,node,row,requests,dialogs,copies,opened,notices,storage,fireTimers(){const work=[...timers.values()];timers.clear();work.forEach(fn=>fn());}};
+ return {context,$,node,row,requests,dialogs,copies,opened,notices,storage,drafts,scope,text,fireTimers(){const work=[...timers.values()];timers.clear();work.forEach(fn=>fn());}};
 }
-test('recovery creates and sends from the captured source then opens the returned conversation',async()=>{
- const ui=fixture(),chat={...ui.row('source',1),host:'remote',access:{source:'cli'}};
+test('recovery creates from the selected source without reading it on menu opening, then sends through the new chat',async()=>{
+ const ui=fixture(),chat={...ui.row('source',1),host:'remote',access:{source:'cli',canRecover:true}};
  ui.context.currentId='another-chat';
  ui.context.api=async(url,body)=>{
   ui.requests.push({url,body});
-  return body?{operationId:body.id,status:'confirmed',phase:'complete',id:'created',host:'remote'}:{status:'idle',operationId:null,id:null,host:'remote',sourceContext};
- };
- const context=ui.context.sessionMenuContext(chat),progress=[];
- assert.equal(typeof context.recover,'function');
- assert.equal(ui.requests.length,1);
- const result=await context.recover(value=>progress.push(value));
- assert.equal(result.status,'confirmed');
- assert.deepEqual(ui.requests.map(row=>row.url),['/remote/source/recover','/remote/source/recover']);
- assert.equal(ui.requests[1].body.id,'request-id');
- assert.deepEqual(Object.keys(ui.requests[1].body),['id','sourceContext']);
- assert.equal(ui.requests[1].body.sourceContext,sourceContext);
- assert.deepEqual(ui.opened,[{id:'created',host:'remote'}]);
- assert.equal(progress.at(-1).status,'confirmed');
- assert.equal([...ui.storage.keys()].filter(key=>key.startsWith('session-recovery:')).length,0);
-});
-test('recovery preserves newer navigation and rejects a changed account before dispatch',async()=>{
- const ui=fixture(),chat=ui.row('source',1);let finish;
- ui.context.api=async(url,body)=>{
-  ui.requests.push({url,body});
-  return body?new Promise(resolve=>{finish=resolve;}):{status:'idle',operationId:null,sourceContext};
- };
- const menu=ui.context.sessionMenuContext(chat),pending=menu.recover();
- await new Promise(resolve=>setImmediate(resolve));
- ui.context.currentId='user-selected';ui.context.chatOpenGeneration++;
- finish({status:'confirmed',phase:'complete',operationId:'request-id',id:'created',host:'local'});
- await pending;assert.deepEqual(ui.opened,[]);
- const stale=ui.context.sessionMenuContext(chat);ui.context.codexActiveAccountId='new-account';
- await assert.rejects(()=>stale.recover(),/连接或账号/);
- assert.equal(ui.requests.length,3);
-});
-test('reopening an unsent recovery retains its text and only an explicit continue submits the same operation',async()=>{
- const ui=fixture(),chat=ui.row('source',1),saved={status:'not_submitted',phase:'sending',operationId:'previous',id:'created',host:'local',sourceContext,text:'读取会话[示例](codex://threads/source)，继续完成'};
- ui.context.api=async(url,body)=>{
-  ui.requests.push({url,body});return body?{...saved,status:'confirmed',phase:'complete'}:saved;
- };
- const first=await ui.context.sessionMenuContext(chat).recover();
- assert.equal(first.text,saved.text);assert.equal(ui.requests.filter(row=>row.body).length,0);assert.deepEqual(ui.opened,[]);
- const freshMenu=ui.context.sessionMenuContext(chat);
- await freshMenu.recover(()=>{},{mode:'continue'});
- assert.equal(ui.requests.at(-1).body.id,'previous');
- assert.equal(ui.requests.filter(row=>row.body).length,1);
- assert.deepEqual(ui.opened,[{id:'created',host:'local'}]);
-});
-test('lost recovery responses are reconciled by reads and unknown sends are never resubmitted',async()=>{
- const ui=fixture(),chat=ui.row('source',1),unknown={operationId:'request-id',status:'unknown',phase:'sending',id:'created',host:'local',sourceContext,message:'结果待核对'};
- ui.context.api=async(url,body)=>{
-  ui.requests.push({url,body});
-  if(body)throw Error('network interrupted');
-  return url.includes('id=')?unknown:{status:'idle',operationId:null,sourceContext};
- };
- const result=await ui.context.sessionMenuContext(chat).recover();
- assert.equal(result.status,'unknown');assert.equal(result.id,'created');
- await ui.context.sessionMenuContext(chat).recover(()=>{},{mode:'continue'});
- assert.equal(ui.requests.filter(row=>row.body).length,1);
- assert.equal(ui.requests[2].url,'/local/source/recover?id=request-id');
- assert.deepEqual(ui.opened,[]);
-});
-test('a stored recovery with no server record can only be explicitly continued using its original ID',async()=>{
- const ui=fixture(),chat=ui.row('source',1);let accept=false,currentSource=sourceContext;
- ui.context.api=async(url,body)=>{
-  ui.requests.push({url,body});
-  if(body){
-   if(!accept){currentSource='b'.repeat(64);throw Error('request did not reach the server');}
-   return {status:'confirmed',phase:'complete',operationId:body.id,id:'created',host:'local'};
-  }
-  return {status:'idle',operationId:null,id:null,host:'local',sourceContext:currentSource};
- };
- const interrupted=await ui.context.sessionMenuContext(chat).recover();
- assert.equal(interrupted.status,'not_submitted');assert.equal(interrupted.phase,'creating');assert.equal(interrupted.operationId,'request-id');
- const reopened=ui.context.sessionMenuContext(chat);
- const checked=await reopened.recover(()=>{},{mode:'check'});
- assert.equal(checked.status,'not_submitted');assert.equal(ui.requests.filter(row=>row.body).length,1);
- accept=true;await reopened.recover(()=>{},{mode:'continue'});
- const writes=ui.requests.filter(row=>row.body);
- assert.equal(writes.length,2);assert.equal(writes[0].body.id,writes[1].body.id);
- assert.equal(writes[0].body.sourceContext,sourceContext);assert.equal(writes[1].body.sourceContext,sourceContext);
- assert.deepEqual(ui.opened,[{id:'created',host:'local'}]);
-});
-test('recovery refuses a missing or invalid menu source identity before writing',async()=>{
- for(const captured of [undefined,null,'a'.repeat(63),'b'.repeat(65),'A'.repeat(64)]){
-  const ui=fixture(),chat=ui.row('source',1);
-  ui.context.api=async(url,body)=>{ui.requests.push({url,body});return {status:'idle',operationId:null,sourceContext:captured};};
-  await assert.rejects(()=>ui.context.sessionMenuContext(chat).recover(),/尚未确认原接入身份/);
-  assert.equal(ui.requests.filter(row=>row.body).length,0);
- }
-});
-test('unavailable recovery storage keeps the menu usable and prevents an unrecorded submission',async()=>{
- const ui=fixture(),chat=ui.row('source',1);
- ui.context.sessionStorage.getItem=()=>{throw Error('Storage unavailable');};
- ui.context.sessionStorage.setItem=()=>{throw Error('Storage unavailable');};
- let menu;assert.doesNotThrow(()=>{menu=ui.context.sessionMenuContext(chat);});
- assert.equal(typeof menu.organization,'function');
- await assert.rejects(()=>menu.recover(),/Storage unavailable/);
- assert.equal(ui.requests.filter(row=>row.body).length,0);
-});
-test('a legacy pending recovery without a server record cannot acquire a different source identity',async()=>{
- const ui=fixture(),chat=ui.row('source',1);
- ui.storage.set('session-recovery:'+JSON.stringify(['gateway','local','source']),'legacy-operation');
- ui.context.api=async(url,body)=>{
-  ui.requests.push({url,body});
-  return {status:'idle',operationId:null,sourceContext:'b'.repeat(64)};
- };
- const first=await ui.context.sessionMenuContext(chat).recover();
- assert.equal(first.status,'unknown');
- const reopened=await ui.context.sessionMenuContext(chat).recover(()=>{},{mode:'continue'});
- assert.equal(reopened.status,'unknown');
- assert.equal(ui.requests.filter(row=>row.body).length,0);
-});
-test('a pending recovery reports server progress while the original write remains in flight',async()=>{
- const ui=fixture(),chat=ui.row('source',1),progress=[];let finish;
- ui.context.api=async(url,body)=>{
-  ui.requests.push({url,body});
-  if(body)return new Promise(resolve=>{finish=resolve;});
-  return url.includes('id=')?{status:'running',phase:'settings',operationId:'request-id',id:'created',host:'local',sourceContext}:{status:'idle',operationId:null,sourceContext};
- };
- const pending=ui.context.sessionMenuContext(chat).recover(value=>progress.push(value));
- await new Promise(resolve=>setImmediate(resolve));ui.fireTimers();await new Promise(resolve=>setImmediate(resolve));
- assert.equal(progress.at(-1).phase,'settings');
- finish({status:'confirmed',phase:'complete',operationId:'request-id',id:'created',host:'local'});
- await pending;ui.fireTimers();assert.equal(progress.at(-1).status,'confirmed');
- assert.equal(ui.requests.filter(row=>row.body).length,1);
-});
-test('the retained recovery destination opens explicitly and cannot cross the original host',async()=>{
- const ui=fixture(),menu=ui.context.sessionMenuContext({...ui.row('source',1),host:'remote'});
- assert.equal(typeof menu.openRecovery,'function');
- await menu.openRecovery({id:'created',host:'remote'});
- assert.deepEqual(ui.opened,[{id:'created',host:'remote'}]);
- await assert.rejects(()=>menu.openRecovery({id:'wrong',host:'local'}),/新会话/);
- ui.context.selectedCodexEntry='other';
- await assert.rejects(()=>menu.openRecovery({id:'created',host:'remote'}),/连接或账号/);
-});
-test('reopening a running recovery follows it with reads until completion',async()=>{
- const ui=fixture(),chat=ui.row('source',1);let reads=0;
- ui.context.api=async(url,body)=>{
-  ui.requests.push({url,body});reads++;
-  return {status:reads===1?'running':'confirmed',phase:reads===1?'sending':'complete',operationId:'existing',id:'created',host:'local',sourceContext};
- };
- const pending=ui.context.sessionMenuContext(chat).recover();
- await new Promise(resolve=>setImmediate(resolve));ui.fireTimers();
- const result=await pending;
- assert.equal(result.status,'confirmed');assert.equal(ui.requests.length,2);assert.equal(ui.requests.filter(row=>row.body).length,0);
- assert.equal(ui.requests[1].url,'/local/source/recover?id=existing');
- assert.deepEqual(ui.opened,[{id:'created',host:'local'}]);
-});
-test('a rejected recovery can be explicitly retried with a new operation after its inputs are corrected',async()=>{
- const ui=fixture(),chat=ui.row('source',1),changedSource='b'.repeat(64),receipts=new Map();let writes=0,sequence=0,activeSource=sourceContext;
- ui.context.uuid=()=> 'operation-'+(++sequence);
- ui.context.api=async(url,body)=>{
-  ui.requests.push({url,body});
-  if(body){
-   writes++;const failed=writes===1||body.sourceContext!==activeSource;
-   const result={operationId:body.id,status:failed?'failed':'confirmed',phase:failed?'validating':'complete',id:failed?null:'created',host:'local',sourceContext:body.sourceContext,message:failed?'原目录不存在':''};
-   receipts.set(body.id,result);activeSource=changedSource;return result;
-  }
-  const operation=new URL(url,'http://fixture.test').searchParams.get('id');
-  return operation?receipts.get(operation):{status:'idle',operationId:null,id:null,sourceContext:activeSource};
+  return url.endsWith('/recover')?{operationId:body.id,status:'created',id:'created',host:'remote',text:ui.text,ready:true,draftAccountIdentity:'account'}:{status:'accepted'};
  };
  const menu=ui.context.sessionMenuContext(chat);
- assert.equal((await menu.recover()).status,'failed');
- assert.equal((await menu.recover(()=>{},{mode:'retry'})).status,'confirmed');
- const submitted=ui.requests.filter(row=>row.body);assert.equal(submitted.length,2);assert.notEqual(submitted[0].body.id,submitted[1].body.id);
- assert.equal(submitted[0].body.sourceContext,sourceContext);assert.equal(submitted[1].body.sourceContext,changedSource);
- assert.equal(receipts.get(submitted[0].body.id).sourceContext,sourceContext);
+ assert.equal(typeof menu.recover,'function');
+ assert.equal(ui.requests.length,0,'Opening the menu must not request or connect the source');
+ const result=await menu.recover();
+ assert.equal(result.status,'created');
+ assert.deepEqual(ui.requests.map(row=>row.url),['/remote/source/recover','/remote/created/send']);
+ assert.deepEqual(Object.keys(ui.requests[0].body),['id']);
+ assert.equal(ui.requests[1].body.text,ui.text);
+ assert.deepEqual(ui.opened,[{id:'created',host:'remote'}]);
+ assert.equal(ui.drafts.load(ui.scope('created','remote')),null,'The normal send clears its confirmed draft');
 });
-test('reopening a failed recovery that created nothing captures the corrected source for a new operation',async()=>{
- for(const replaceMenu of [true,false]){
- const ui=fixture(),chat=ui.row('source',1),changedSource='b'.repeat(64);let activeSource=sourceContext,sequence=0;
- const receipts=new Map();ui.context.uuid=()=> 'operation-'+(++sequence);
- ui.context.api=async(url,body)=>{
-  ui.requests.push({url,body});
-  if(body){
-   const failed=body.sourceContext!==activeSource;
-   const result={operationId:body.id,status:failed?'failed':'confirmed',phase:failed?'validating':'complete',id:failed?null:'created',host:'local',sourceContext:body.sourceContext};
-   receipts.set(body.id,result);return result;
-  }
-  const operation=new URL(url,'http://fixture.test').searchParams.get('id');
-  return operation?receipts.get(operation):{status:'idle',operationId:null,id:null,sourceContext:activeSource};
- };
- const original=ui.context.sessionMenuContext(chat);activeSource=changedSource;
- const failed=await original.recover();assert.equal(failed.status,'failed');assert.equal(failed.id,null);
- const reopened=await (replaceMenu?ui.context.sessionMenuContext(chat):original).recover();
- assert.equal(reopened.status,'confirmed');
- const writes=ui.requests.filter(row=>row.body);
- assert.equal(writes.length,2);assert.notEqual(writes[1].body.id,writes[0].body.id);
- assert.equal(writes[0].body.sourceContext,sourceContext);assert.equal(writes[1].body.sourceContext,changedSource);
- assert.equal(receipts.get(writes[0].body.id).sourceContext,sourceContext);
- }
+test('reloading while opening the known destination keeps its draft and does not start its first message again',async()=>{
+ const first=fixture(),chat=first.row('source',1);let opened,finish;
+ first.context.api=async(url,body)=>{first.requests.push({url,body});return {operationId:body.id,status:'created',id:'created',host:'local',text:first.text,ready:true,draftAccountIdentity:'account'};};
+ first.context.openChat=async()=>{opened=true;await new Promise(resolve=>{finish=resolve;});};
+ const pending=first.context.sessionMenuContext(chat).recover();
+ while(!opened)await new Promise(resolve=>setImmediate(resolve));
+ const reloaded=fixture(first.storage);
+ reloaded.context.api=async(url,body)=>{reloaded.requests.push({url,body});return {operationId:'request-id',status:'created',id:'created',host:'local',text:first.text,ready:true,draftAccountIdentity:'account'};};
+ await reloaded.context.sessionMenuContext(chat).recover();
+ assert.deepEqual(reloaded.requests.map(row=>row.body),[undefined],'A retained creation is checked once; first sending stays with the original attempt');
+ assert.deepEqual(reloaded.opened,[{id:'created',host:'local'}]);
+ assert.equal(reloaded.$('message').value,first.text);
+ first.context.csrf='expired';finish();await pending;
 });
-test('retry does not rebind a pending recovery or a failed recovery with a created or unconfirmed destination',async()=>{
- for(const [status,id] of [['running','created'],['unknown',null],['unknown','created'],['not_submitted','created'],['failed','created'],['failed',undefined]]){
-  const ui=fixture(),chat=ui.row('source',1),key='session-recovery:'+JSON.stringify(['gateway','local','source']);
-  ui.storage.set(key,JSON.stringify({id:'previous',sourceContext}));
-  const saved={operationId:'previous',status,host:'local',sourceContext,...(id===undefined?{}:{id})};
-  ui.context.api=async(url,body)=>{ui.requests.push({url,body});return url.includes('id=')?saved:{status:'idle',id:null,sourceContext:'b'.repeat(64)};};
-  const result=await ui.context.sessionMenuContext(chat).recover(()=>{},{mode:'retry',isVisible:()=>false});
-  assert.equal(result.operationId,'previous');assert.equal(result.sourceContext,sourceContext);
-  assert.equal(ui.requests.length,1);assert.equal(ui.requests.filter(row=>row.body).length,0);
-  assert.deepEqual(JSON.parse(ui.storage.get(key)),{id:'previous',sourceContext});
- }
-});
-test('a recovery deduplicated by the server follows the returned operation identity',async()=>{
- const ui=fixture(),chat=ui.row('source',1);
- ui.context.api=async(url,body)=>{
-  ui.requests.push({url,body});
-  if(body)return {status:'running',phase:'sending',operationId:'other-device',id:'created',host:'local',sourceContext};
-  if(url.includes('id='))return {status:'confirmed',phase:'complete',operationId:'other-device',id:'created',host:'local',sourceContext};
-  return {status:'idle',operationId:null,sourceContext};
- };
+test('a late created response saves only the target draft and preserves text already written there',async()=>{
+ const ui=fixture(),chat=ui.row('source',1);let finish;
+ ui.context.currentId='source';ui.context.codexDraftScope=ui.scope('source');ui.$('message').value='source draft';
+ ui.context.api=async(url,body)=>{ui.requests.push({url,body});return new Promise(resolve=>{finish=resolve;});};
  const pending=ui.context.sessionMenuContext(chat).recover();
- await new Promise(resolve=>setImmediate(resolve));ui.fireTimers();await pending;
- assert.equal(ui.requests.at(-1).url,'/local/source/recover?id=other-device');
- assert.equal(ui.requests.filter(row=>row.body).length,1);
+ while(!finish)await new Promise(resolve=>setImmediate(resolve));
+ ui.drafts.save(ui.scope('created'),{text:'already typing in the created chat'});
+ ui.context.currentId='user-selected';ui.context.chatOpenGeneration++;ui.$('message').value='newer current draft';
+ finish({operationId:'request-id',status:'created',id:'created',host:'local',text:ui.text,ready:true,draftAccountIdentity:'account'});
+ await pending;
+ assert.equal(ui.drafts.load(ui.scope('created')).text,'already typing in the created chat');
+ assert.equal(ui.$('message').value,'newer current draft');
+ assert.deepEqual(ui.opened,[]);assert.equal(ui.requests.length,1);
+});
+test('a completed creation still opens with a private draft when storage becomes unavailable',async()=>{
+ const ui=fixture();
+ ui.context.api=async(url,body)=>{
+  ui.requests.push({url,body});ui.context.sessionStorage.setItem=()=>{throw Error('quota exhausted');};
+  return {operationId:body.id,status:'created',id:'created',host:'local',text:ui.text,ready:false,message:'连接暂未完成',draftAccountIdentity:'account'};
+ };
+ await ui.context.sessionMenuContext(ui.row('source',1)).recover();
+ assert.deepEqual(ui.opened,[{id:'created',host:'local'}]);
+ assert.equal(ui.context.codexProvisionalDrafts.get('local|created').text,ui.text);
+ assert.equal(ui.$('message').value,ui.text);
+ assert.equal(ui.$('send-error').textContent,'连接暂未完成');
+});
+test('an unready creation leaves the ordinary draft in the new chat for a manual first send',async()=>{
+ const ui=fixture();
+ ui.context.api=async(url,body)=>{ui.requests.push({url,body});return url.endsWith('/recover')?{operationId:body.id,status:'created',id:'created',host:'local',text:ui.text,ready:false,message:'模型设置未完成',draftAccountIdentity:'account'}:{status:'accepted'};};
+ await ui.context.sessionMenuContext(ui.row('source',1)).recover();
+ assert.deepEqual(ui.opened,[{id:'created',host:'local'}]);assert.equal(ui.requests.length,1);
+ assert.equal(ui.$('message').value,ui.text);assert.equal(ui.$('send-error').textContent,'模型设置未完成');
+ await ui.$('composer').onsubmit({preventDefault(){}});
+ assert.equal(ui.requests[1].url,'/local/created/send');assert.equal(ui.drafts.load(ui.scope('created')),null);
+});
+test('a rejected first send keeps the new chat and permits the normal send button to retry',async()=>{
+ const ui=fixture();let sends=0;
+ ui.context.api=async(url,body)=>{
+  ui.requests.push({url,body});
+  if(url.endsWith('/recover'))return {operationId:body.id,status:'created',id:'created',host:'local',text:ui.text,ready:true,draftAccountIdentity:'account'};
+  if(++sends===1)throw Object.assign(Error('新会话尚未连接'),{status:400,code:'send_not_submitted'});
+  return {status:'accepted'};
+ };
+ await ui.context.sessionMenuContext(ui.row('source',1)).recover();
+ assert.equal(ui.$('message').value,ui.text);assert.equal(ui.drafts.pendingSend(ui.scope('created')),null);
+ assert.equal(ui.$('send-error').textContent,'新会话尚未连接');
+ await ui.$('composer').onsubmit({preventDefault(){}});
+ assert.deepEqual(ui.requests.map(row=>row.url),['/local/source/recover','/local/created/send','/local/created/send']);
+ assert.deepEqual(ui.opened,[{id:'created',host:'local'}]);
+ assert.equal(ui.drafts.load(ui.scope('created')),null);
+});
+test('an unknown first send retains the ordinary pending submission and its target draft',async()=>{
+ const ui=fixture();
+ ui.context.api=async(url,body)=>{ui.requests.push({url,body});return url.endsWith('/recover')?{operationId:body.id,status:'created',id:'created',host:'local',text:ui.text,ready:true,draftAccountIdentity:'account'}:{status:'unknown'};};
+ await ui.context.sessionMenuContext(ui.row('source',1)).recover();
+ const pending=ui.drafts.pendingSend(ui.scope('created'));
+ assert.equal(pending.id,ui.requests[0].body.id);assert.equal(pending.body.text,ui.text);
+ assert.equal(ui.drafts.load(ui.scope('created')).text,ui.text);assert.match(ui.$('send-error').textContent,/可能已送达/);
+ assert.equal(ui.requests.filter(row=>row.url.endsWith('/recover')).length,1);
+});
+test('a lost creation response is checked once with the same ID, then the known chat receives its first message',async()=>{
+ const ui=fixture();
+ ui.context.api=async(url,body)=>{
+  ui.requests.push({url,body});
+  if(url.endsWith('/recover'))throw Error('network interrupted');
+  return url.includes('/recover?id=')?{operationId:'request-id',status:'created',id:'created',host:'local',text:ui.text,ready:true,draftAccountIdentity:'account'}:{status:'accepted'};
+ };
+ await ui.context.sessionMenuContext(ui.row('source',1)).recover();
+ assert.deepEqual(ui.requests.map(row=>row.url),['/local/source/recover','/local/source/recover?id='+ui.requests[0].body.id,'/local/created/send']);
+ assert.equal(ui.requests.filter(row=>row.url==='/local/source/recover').length,1);
+});
+test('an unknown creation is only checked on the next click and is never automatically recreated',async()=>{
+ const ui=fixture();
+ ui.context.api=async(url,body)=>{ui.requests.push({url,body});if(body)throw Error('network interrupted');return {operationId:'request-id',status:'unknown',id:null,host:'local',message:'创建结果尚未确认'};};
+ const chat=ui.row('source',1);
+ await assert.rejects(()=>ui.context.sessionMenuContext(chat).recover(),/尚未确认/);
+ await assert.rejects(()=>ui.context.sessionMenuContext(chat).recover(),/尚未确认/);
+ assert.deepEqual(ui.requests.map(row=>!!row.body),[true,false,false]);
+ assert.ok(ui.requests.slice(1).every(row=>row.url.endsWith('id='+ui.requests[0].body.id)));
+ assert.deepEqual(ui.opened,[]);
+});
+test('a missing receipt after a lost POST retains its ID and only another explicit click retries that same creation',async()=>{
+ const ui=fixture(),chat=ui.row('source',1);let writes=0;
+ ui.context.api=async(url,body)=>{
+  ui.requests.push({url,body});
+  if(!body)return {status:'idle',id:null,host:'local'};
+  if(++writes===1)throw Error('lost response from a queued request');
+  return {operationId:body.id,status:'created',id:'created',host:'local',text:ui.text,ready:false,draftAccountIdentity:'account'};
+ };
+ await assert.rejects(()=>ui.context.sessionMenuContext(chat).recover(),/尚未确认/);
+ const id=ui.requests[0].body.id;assert.equal(writes,1,'A lost response never triggers another automatic POST');
+ await ui.context.sessionMenuContext(chat).recover();
+ assert.deepEqual(ui.requests.map(row=>!!row.body),[true,false,false,true]);
+ assert.equal(ui.requests[3].body.id,id,'A read that found nothing cannot replace the queued request ID');
+});
+test('unavailable session storage keeps creation attempts in memory and still opens a later known target',async()=>{
+ const ui=fixture(),chat=ui.row('source',1);let known=false;
+ ui.context.sessionStorage.getItem=()=>{throw Error('storage unavailable');};
+ ui.context.sessionStorage.setItem=()=>{throw Error('storage unavailable');};
+ ui.context.api=async(url,body)=>{
+  ui.requests.push({url,body});if(body)throw Error('lost response');
+  return known?{operationId:new URL(url,'http://fixture').searchParams.get('id'),status:'created',id:'created',host:'local',text:ui.text,ready:false,draftAccountIdentity:'account'}:{status:'unknown',id:null,message:'创建结果尚未确认'};
+ };
+ await assert.rejects(()=>ui.context.sessionMenuContext(chat).recover(),/创建结果尚未确认/);
+ assert.equal(ui.requests.length,2,'Storage failure must not prevent the first explicit creation');
+ known=true;await ui.context.sessionMenuContext(chat).recover();
+ assert.equal(ui.requests[2].body,undefined);assert.ok(ui.requests[2].url.endsWith('id='+ui.requests[0].body.id));
+ assert.deepEqual(ui.opened,[{id:'created',host:'local'}]);
+});
+test('an unknown draft account displays the private first message without guessing an account and later preserves edits',async()=>{
+ const ui=fixture();ui.context.openDraftAccount='';
+ ui.context.codexQuotes={quotes:[],restore(values){this.quotes=values;},reset(){this.quotes=[];},serialize:text=>text};
+ ui.context.api=async(url,body)=>{ui.requests.push({url,body});return {operationId:body.id,status:'created',id:'created',host:'local',text:ui.text,ready:false,draftAccountIdentity:''};};
+ await ui.context.sessionMenuContext(ui.row('source',1)).recover();
+ assert.equal(ui.$('message').value,ui.text,'The real account binder must show the private text even before account evidence arrives');
+ assert.equal(ui.context.codexDraftScope,null);assert.equal(ui.drafts.load(ui.scope('created')),null);
+ ui.$('message').value='my new draft';ui.context.codexQuotes.quotes=[{text:'quoted edit'}];ui.$('message').oninput();
+ ui.context.bindCodexDraft({draftAccountIdentity:''});
+ assert.equal(ui.$('message').value,'my new draft');
+ ui.context.bindCodexDraft({draftAccountIdentity:'account'});
+ assert.equal(ui.drafts.load(ui.scope('created')).text,'my new draft');assert.equal(ui.drafts.load(ui.scope('created')).quotes[0].text,'quoted edit');
+});
+test('a target whose first view lacks account data still shows the creation text saved under its verified receipt account',async()=>{
+ const ui=fixture();ui.context.openDraftAccount='';
+ ui.context.api=async(url,body)=>{ui.requests.push({url,body});return {operationId:body.id,status:'created',id:'created',host:'local',text:ui.text,ready:false,draftAccountIdentity:'account'};};
+ await ui.context.sessionMenuContext(ui.row('source',1)).recover();
+ assert.equal(ui.$('message').value,ui.text);assert.equal(ui.context.codexDraftScope,null);
+ ui.context.bindCodexDraft({draftAccountIdentity:'account'});assert.equal(ui.$('message').value,ui.text);
+});
+test('a fresh private first message can use ordinary sending when both browser storages are unavailable',async()=>{
+ const ui=fixture();
+ ui.context.sessionStorage.getItem=()=>{throw Error('storage unavailable');};ui.context.sessionStorage.setItem=()=>{throw Error('storage unavailable');};
+ ui.context.api=async(url,body)=>{ui.requests.push({url,body});return url.endsWith('/recover')?{operationId:body.id,status:'created',id:'created',host:'local',text:ui.text,ready:true,draftAccountIdentity:'account'}:{status:'accepted'};};
+ await ui.context.sessionMenuContext(ui.row('source',1)).recover();
+ assert.deepEqual(ui.requests.map(row=>row.url),['/local/source/recover','/local/created/send']);
+ assert.equal(ui.requests[1].body.text,ui.text);assert.equal(ui.$('message').value,'');
+});
+for(const fields of [{text:'fixed'},{text:'',sendMode:'queue'},{text:'',workMode:'plan'},{text:'',skills:['chosen']}])test('recovery never overwrites or automatically sends an existing target draft '+JSON.stringify(fields),async()=>{
+ const ui=fixture(),original={...fields,text:fields.text==='fixed'?ui.text:fields.text};
+ ui.drafts.save(ui.scope('created'),original);
+ ui.context.api=async(url,body)=>{ui.requests.push({url,body});return url.endsWith('/recover')?{operationId:body.id,status:'created',id:'created',host:'local',text:ui.text,ready:true,draftAccountIdentity:'account'}:{status:'accepted'};};
+ await ui.context.sessionMenuContext(ui.row('source',1)).recover();
+ assert.equal(ui.requests.filter(row=>row.url.endsWith('/send')).length,0);
+ assert.equal(ui.drafts.load(ui.scope('created')).text,original.text);
+ if(original.sendMode)assert.equal(ui.drafts.load(ui.scope('created')).sendMode,original.sendMode);
+ if(original.workMode)assert.equal(ui.drafts.load(ui.scope('created')).workMode,original.workMode);
+ if(original.skills)assert.deepEqual(ui.drafts.load(ui.scope('created')).skills,original.skills);
+});
+test('a quote-only edit while the target opens is not included in automatic first sending or cleared',async()=>{
+ const ui=fixture(),open=ui.context.openChat;
+ ui.context.codexQuotes={quotes:[],restore(values){this.quotes=values;},reset(){this.quotes=[];},serialize(text){return this.quotes.map(quote=>'> '+quote.text).join('\n')+'\n'+text;}};
+ ui.context.openChat=async(id,host)=>{await open(id,host);ui.context.codexQuotes.quotes=[{text:'user quote'}];ui.context.codexDraftTouched=true;ui.context.saveDraft();};
+ ui.context.api=async(url,body)=>{ui.requests.push({url,body});return url.endsWith('/recover')?{operationId:body.id,status:'created',id:'created',host:'local',text:ui.text,ready:true,draftAccountIdentity:'account'}:{status:'accepted'};};
+ await ui.context.sessionMenuContext(ui.row('source',1)).recover();
+ assert.equal(ui.requests.filter(row=>row.url.endsWith('/send')).length,0);
+ assert.equal(ui.$('message').value,ui.text);assert.equal(ui.context.codexQuotes.quotes[0].text,'user quote');
+});
+test('returning to the list while target history loads prevents automatic sending to a hidden chat',async()=>{
+ const ui=fixture(),open=ui.context.openChat;let finish;
+ ui.context.openChat=async(id,host)=>{await open(id,host);await new Promise(resolve=>{finish=resolve;});};
+ ui.context.api=async(url,body)=>{ui.requests.push({url,body});return url.endsWith('/recover')?{operationId:body.id,status:'created',id:'created',host:'local',text:ui.text,ready:true,draftAccountIdentity:'account'}:{status:'accepted'};};
+ const pending=ui.context.sessionMenuContext(ui.row('source',1)).recover();while(!finish)await new Promise(resolve=>setImmediate(resolve));
+ const generation=ui.context.chatOpenGeneration;ui.$('back').onclick();assert.equal(ui.context.currentId,'created');assert.equal(ui.context.chatOpenGeneration,generation);
+ finish();await pending;
+ assert.equal(ui.requests.filter(row=>row.url.endsWith('/send')).length,0);assert.equal(ui.drafts.load(ui.scope('created')).text,ui.text);
+});
+test('each settled source shortcut is a new creation attempt and default model warnings remain visible',async()=>{
+ const ui=fixture();let created=0;
+ ui.context.api=async(url,body)=>{ui.requests.push({url,body});return url.endsWith('/recover')?{operationId:body.id,status:'created',id:'created-'+(++created),host:'local',text:ui.text,ready:true,draftAccountIdentity:'account',warning:'源模型不可用，使用默认模型'}:{status:'accepted'};};
+ const chat=ui.row('source',1);
+ await ui.context.sessionMenuContext(chat).recover();await ui.context.sessionMenuContext(chat).recover();
+ const creations=ui.requests.filter(row=>row.url.endsWith('/recover'));
+ assert.equal(creations.length,2);assert.notEqual(creations[0].body.id,creations[1].body.id);
+ assert.deepEqual(ui.opened,[{id:'created-1',host:'local'},{id:'created-2',host:'local'}]);
+ assert.equal(ui.notices.at(-1),'源模型不可用，使用默认模型');
+});
+test('recovery visibility follows the reported capability for IDE, WSL and other clients',()=>{
+ const ui=fixture();
+ for(const access of [{source:'ide',canRecover:true},{source:'cli',runtime:'wsl',canRecover:true},{source:'desktop',canRecover:true}]){
+  assert.equal(typeof ui.context.sessionMenuContext({...ui.row('source',1),access}).recover,'function');
+ }
+ assert.equal(ui.context.sessionMenuContext({...ui.row('source',1),access:{source:'cli',canRecover:false}}).recover,undefined);
+ assert.equal(ui.context.sessionMenuContext({...ui.row('source',1),access:{source:'desktop',canRecover:true}},'claude').recover,undefined);
+ assert.equal(ui.requests.length,0);
 });
 test('native organization preserves host and expected assignment and rejects stale authentication',async()=>{
  const ui=fixture(),chat={...ui.row('native',1),host:'remote'};

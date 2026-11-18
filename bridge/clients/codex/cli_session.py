@@ -24,6 +24,7 @@ from bridge.features.sessions import linux_permissions
 from bridge.features.sessions.store import SessionStore, StoreUnavailable
 
 MAX_REASONING_PARTS = 1024
+_SERVICE_TIER_UNSET = object()
 
 
 def _managed_cli(home):
@@ -207,13 +208,20 @@ class CliSessions:
         """Fail closed on unknown native status before a local account change."""
         return self.daemon_status() != 'stopped'
 
-    def create(self, cwd, title='', on_start=None, on_created=None, model=None, effort=None, *, settings=None):
+    def create(self, cwd, title='', on_start=None, on_created=None, model=None, effort=None, *,
+               settings=None, service_tier=_SERVICE_TIER_UNSET):
         """An explicit new CLI chat; no turn is started."""
         if not isinstance(cwd, str) or not cwd or (self.alias is None and not Path(cwd).is_dir()):
             raise AppServerUnavailable('CLI 项目目录不存在')
-        from bridge.features.sessions.create import creation_settings, normalize_creation_title, verify_creation_settings
+        from bridge.features.sessions.create import (
+            CreationUnavailable, creation_settings, model_overrides, normalize_creation_title, verify_creation_settings)
         title = normalize_creation_title(title)
         overrides = creation_settings(settings, model, effort)
+        if service_tier is not _SERVICE_TIER_UNSET:
+            tier = model_overrides(service_tier=service_tier)['serviceTier']
+            if 'serviceTier' in overrides and overrides['serviceTier'] != tier:
+                raise CreationUnavailable('原会话速度设置与新建参数不一致')
+            overrides['serviceTier'] = tier
         info = self._connect_explicit()
         if self.alias is None and Path(info['codexHome']) != self.home:
             raise AppServerUnavailable('Codex CLI runtime belongs to another home')
@@ -241,6 +249,8 @@ class CliSessions:
                 raise AppServerUnsupported('CLI creation returned an unverified thread')
             if settings is not None:
                 verify_creation_settings(result, overrides)
+            if service_tier is not _SERVICE_TIER_UNSET:
+                verify_creation_settings(result, {'serviceTier': service_tier})
             if model is not None and (result.get('model') != model or effort is not None and result.get('reasoningEffort') != effort):
                 raise AppServerUnsupported('新聊天已创建，但模型或思考强度未确认；请检查原会话，不要重复创建')
             with self.lock:
@@ -257,6 +267,8 @@ class CliSessions:
             state = self.refresh(thread_id)
             if settings is not None:
                 verify_creation_settings(state, overrides)
+            if service_tier is not _SERVICE_TIER_UNSET:
+                verify_creation_settings(state, {'serviceTier': service_tier})
             return state
         except Exception as exc:
             exc.created_id = thread_id
