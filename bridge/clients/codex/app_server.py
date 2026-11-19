@@ -5,12 +5,15 @@ daemon, resumes a thread, or changes its model, provider, cwd, or approvals.
 """
 
 import json
+import logging
 import os
 import subprocess
 import threading
 from concurrent.futures import Future, TimeoutError
 from bridge.clients.websocket import WebSocket
 from pathlib import Path
+
+LOG = logging.getLogger(__name__)
 
 
 class AppServerError(RuntimeError):
@@ -40,7 +43,8 @@ class CodexAppServer:
 
     def __init__(self, socket_path, cli='codex', on_event=None,
                  on_server_request=None, on_disconnect=None, process_factory=None,
-                 command=None, check_socket=True, client_name='codex-mobile-bridge'):
+                 command=None, check_socket=True, client_name='codex-mobile-bridge',
+                 on_callback_error=None):
         if not socket_path or not Path(socket_path).is_absolute():
             raise ValueError('An absolute existing control socket path is required')
         self.socket_path = str(socket_path)
@@ -52,6 +56,7 @@ class CodexAppServer:
         self.on_event = on_event or (lambda event: None)
         self.on_server_request = on_server_request or (lambda request: None)
         self.on_disconnect = on_disconnect or (lambda: None)
+        self.on_callback_error = on_callback_error or (lambda message, error, process: None)
         self.process_factory = process_factory or subprocess.Popen
         self.process = None
         self.transport = None
@@ -200,6 +205,22 @@ class CodexAppServer:
             self._send({'id': request_id, 'result': result}, expected_connection=expected_connection,
                        current_guard=current_guard)
 
+    def _dispatch_callback(self, kind, callback, message, process):
+        try:
+            callback(message)
+        except Exception as error:
+            with self.lock:
+                if self.process is not process:
+                    return
+            # Callback failures do not imply a broken transport. Native payloads
+            # and exception text can contain private data; log only the class.
+            LOG.warning('Codex callback failed kind=%s error_type=%s', kind, type(error).__name__)
+            try:
+                self.on_callback_error(message, error, process)
+            except Exception as hook_error:
+                LOG.warning('Codex callback cleanup failed kind=%s error_type=%s',
+                            kind, type(hook_error).__name__)
+
     def _read_loop(self, process, transport):
         try:
             while True:
@@ -217,9 +238,9 @@ class CodexAppServer:
                         if future is not None and not future.done():
                             future.set_result(message)
                 elif 'id' in message and 'method' in message:
-                    self.on_server_request(message)
+                    self._dispatch_callback('server_request', self.on_server_request, message, process)
                 elif 'method' in message:
-                    self.on_event(message)
+                    self._dispatch_callback('event', self.on_event, message, process)
         except (OSError, EOFError, ValueError, TypeError, AppServerError):
             pass
         finally:

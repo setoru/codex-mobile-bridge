@@ -1,4 +1,5 @@
 import tempfile
+import copy
 import io
 import json
 import os
@@ -15,6 +16,7 @@ from bridge.clients.codex.app_server import AppServerError, AppServerUnavailable
 from bridge.features.sessions.goal import GoalUnavailable, GoalUnsupported
 from bridge.features.sessions.model import normalize_state
 from bridge.clients.codex.cli_session import CliSessions, _local_cli, _managed_cli, _ssh_daemon_start_command, _ssh_proxy_command
+from test_codex_app_server import FixtureProcess
 
 ROOT = Path(__file__).resolve().parents[1]
 MANAGED_NAME = 'codex.exe' if os.name == 'nt' else 'codex'
@@ -798,6 +800,29 @@ class CliSessionTests(unittest.TestCase):
         self.assertNotIn('thread-a', self.sessions.joined)
         self.assertNotIn('thread-a', self.sessions.attaching)
 
+    def test_connection_change_after_goal_read_cleans_unfinished_join_without_replay(self):
+        original = self.fake.request
+        replacement = object()
+        self.fake.close = Mock(wraps=self.fake.close)
+        def request(method, params, **kwargs):
+            result = original(method, params, **kwargs)
+            if method == 'thread/goal/get':
+                self.sessions._server_request({'id': 71, 'method': 'item/commandExecution/requestApproval',
+                                               'params': {'threadId': 'thread-a', 'turnId': 'turn-a'}})
+                self.fake.process = replacement
+            return result
+        self.fake.request = request
+        with self.assertRaisesRegex(AppServerUnavailable, 'connection changed'):
+            self.sessions.attach('thread-a', explicit=True)
+        self.assertIs(self.fake.process, replacement)
+        self.fake.close.assert_not_called()
+        self.assertEqual(sum(method == 'thread/resume' for method, _ in self.fake.sent), 1)
+        self.assertFalse(any(method in ('turn/start', 'turn/steer') for method, _ in self.fake.sent))
+        self.assertEqual(self.fake.replies, [])
+        for collection in (self.sessions.joined, self.sessions.states, self.sessions.metadata,
+                           self.sessions.attaching, self.sessions.requests):
+            self.assertNotIn('thread-a', collection)
+
     def test_custom_provider_catalog_never_offers_openai_models(self):
         self.sessions.attach('thread-a', explicit=True)
         self.sessions.metadata['thread-a']['modelProvider'] = 'custom'
@@ -1296,6 +1321,182 @@ class CliSessionTests(unittest.TestCase):
         second.join(2)
         self.assertEqual(len(results), 2)
         self.assertEqual(len([method for method, _ in self.fake.sent if method == 'thread/resume']), 1)
+
+
+class CliReaderIntegrationTests(unittest.TestCase):
+    def setUp(self):
+        (ROOT / '.tmp').mkdir(exist_ok=True)
+        self.temp = tempfile.TemporaryDirectory(dir=ROOT / '.tmp')
+        self.addCleanup(self.temp.cleanup)
+        self.home = Path(self.temp.name)
+        control = self.home / 'app-server-control'
+        control.mkdir()
+        (control / 'app-server-control.sock').touch()
+        self.states, self.disconnections, self.processes = [], [], []
+        self.threads = {sid: {'id': sid, 'cwd': '/original/' + sid,
+            'modelProvider': 'original-provider', 'model': 'original-model',
+            'status': {'type': 'active'}, 'turns': [{'id': 'turn-' + sid, 'status': 'inProgress', 'items': []}]}
+            for sid in ('thread-a', 'thread-b')}
+        def resume(params):
+            thread = copy.deepcopy(self.threads[params['threadId']])
+            return {'thread': thread, 'cwd': thread['cwd'], 'modelProvider': thread['modelProvider'],
+                    'model': thread['model']}
+        def factory(*args, **kwargs):
+            process = FixtureProcess(*args, rpc_results={
+                'initialize': {'codexHome': str(self.home)},
+                'thread/loaded/list': {'data': list(self.threads), 'nextCursor': None},
+                'thread/read': lambda params: {'thread': copy.deepcopy(self.threads[params['threadId']])},
+                'thread/resume': resume, 'thread/goal/get': {'goal': None}}, **kwargs)
+            self.processes.append(process)
+            return process
+        runtime = patch('bridge.clients.codex.cli_session._local_cli', return_value='fixture-only-codex')
+        runtime.start()
+        self.addCleanup(runtime.stop)
+        self.sessions = CliSessions(self.home,
+            lambda sid, state: self.states.append((sid, state)),
+            lambda sid=None: self.disconnections.append(sid), process_factory=factory)
+        self.addCleanup(self.sessions.close)
+        for sid in self.threads:
+            self.sessions.attach(sid, explicit=True)
+        self.process = self.processes[0]
+        self.initial_requests = len(self.process.seen)
+
+    def roundtrip(self):
+        result = self.sessions.client.request('thread/read',
+            {'threadId': 'thread-b', 'includeTurns': False}, timeout=1, replay_safe=True)
+        self.assertEqual(result['thread']['id'], 'thread-b')
+        self.assertIs(self.sessions.client.process, self.process)
+        self.assertIsNone(self.process.poll())
+
+    def assert_no_unrequested_writes(self):
+        messages = self.process.seen[self.initial_requests:]
+        self.assertFalse(any(message.get('method') in ('thread/resume', 'turn/start', 'turn/steer')
+                             or message.get('id') == 71 for message in messages))
+
+    def test_nullable_native_command_output_keeps_shared_reader_and_both_threads(self):
+        self.process.send({'method': 'item/started', 'params': {
+            'threadId': 'thread-a', 'turnId': 'turn-thread-a', 'item': {
+                'id': 'command-a', 'type': 'commandExecution', 'command': 'synthetic command',
+                'status': 'inProgress', 'aggregatedOutput': None, 'exitCode': None}}})
+        for delta in ('first ', 'second'):
+            self.process.send({'method': 'item/commandExecution/outputDelta', 'params': {
+                'threadId': 'thread-a', 'turnId': 'turn-thread-a', 'itemId': 'command-a', 'delta': delta}})
+        self.process.send({'id': 71, 'method': 'item/commandExecution/requestApproval',
+                           'params': {'threadId': 'thread-a', 'turnId': 'turn-thread-a'}})
+        self.process.send({'method': 'thread/status/changed', 'params': {
+            'threadId': 'thread-b', 'status': {'type': 'idle'}}})
+        self.roundtrip()
+        command = self.sessions.states['thread-a']['turns'][0]['items'][0]
+        self.assertEqual(command['aggregatedOutput'], 'first second')
+        self.assertEqual(self.sessions.states['thread-b']['threadRuntimeStatus']['type'], 'idle')
+        self.assertEqual(set(self.sessions.joined), {'thread-a', 'thread-b'})
+        self.assertTrue(all(process is self.process for process in self.sessions.joined.values()))
+        self.assertEqual(self.disconnections, [])
+        self.assertIn(71, self.sessions.requests['thread-a'])
+        self.assert_no_unrequested_writes()
+
+    def test_state_callback_failure_revokes_only_affected_thread_and_preserves_reader(self):
+        def on_state(sid, state):
+            if sid == 'thread-a':
+                raise ValueError('Synthetic state projection failure')
+            self.states.append((sid, state))
+        self.sessions.on_state = on_state
+        for sid in ('thread-a', 'thread-b'):
+            self.process.send({'method': 'thread/status/changed', 'params': {
+                'threadId': sid, 'status': {'type': 'idle'}}})
+        self.roundtrip()
+        self.assertNotIn('thread-a', self.sessions.joined)
+        self.assertIs(self.sessions.joined['thread-b'], self.process)
+        self.assertEqual(self.sessions.states['thread-b']['threadRuntimeStatus']['type'], 'idle')
+        self.assertEqual(self.disconnections, ['thread-a'])
+        self.assert_no_unrequested_writes()
+
+    def test_old_callback_error_cannot_revoke_current_native_join(self):
+        old_process = object()
+        message = {'method': 'thread/status/changed', 'params': {'threadId': 'thread-a'}}
+        self.sessions._callback_error(message, TypeError('Synthetic retired reader error'), old_process)
+        self.roundtrip()
+        self.assertEqual(set(self.sessions.joined), {'thread-a', 'thread-b'})
+        self.assertEqual(self.disconnections, [])
+        self.assert_no_unrequested_writes()
+
+    def assert_late_attach_success_cannot_restore_failed_thread(self, blocked_method):
+        sid = 'thread-c'
+        self.threads[sid] = {'id': sid, 'cwd': '/original/' + sid,
+            'modelProvider': 'original-provider', 'model': 'original-model',
+            'status': {'type': 'active'}, 'turns': []}
+        self.process.rpc_results['thread/loaded/list']['data'].append(sid)
+        entered, release, failed = threading.Event(), threading.Event(), threading.Event()
+        original_result = self.process.rpc_results[blocked_method]
+        def delay_success(params):
+            if params.get('threadId') == sid:
+                entered.set()
+                release.wait(2)
+            return original_result(params) if callable(original_result) else original_result
+        self.process.rpc_results[blocked_method] = delay_success
+        original_event = self.sessions.client.on_event
+        def on_event(message):
+            if message['params'].get('threadId') == sid:
+                raise TypeError('Synthetic event failure during native join')
+            original_event(message)
+        self.sessions.client.on_event = on_event
+        def on_disconnect(thread_id=None):
+            self.disconnections.append(thread_id)
+            if thread_id == sid:
+                failed.set()
+        self.sessions.on_disconnect = on_disconnect
+        outcome = {}
+        def attach():
+            try:
+                outcome['state'] = self.sessions.attach(sid, explicit=True)
+            except Exception as error:
+                outcome['error'] = error
+        worker = threading.Thread(target=attach)
+        worker.start()
+        try:
+            self.assertTrue(entered.wait(2), 'native join did not reach the delayed reply')
+            self.assertIn(sid, self.sessions.attaching)
+            self.process.send({'method': 'thread/status/changed', 'params': {
+                'threadId': sid, 'status': {'type': 'active'}}})
+            self.assertTrue(failed.wait(2), 'callback error did not revoke the attaching thread')
+            release.set()
+            worker.join(2)
+            self.assertFalse(worker.is_alive())
+            self.assertNotIn('state', outcome)
+            self.assertIsInstance(outcome.get('error'), AppServerUnavailable)
+            self.assertEqual(set(self.sessions.joined), {'thread-a', 'thread-b'})
+            for collection in (self.sessions.attaching, self.sessions.metadata, self.sessions.states,
+                               self.sessions.requests):
+                self.assertNotIn(sid, collection)
+            self.assertEqual(self.disconnections, [sid])
+            self.roundtrip()
+            messages = self.process.seen[self.initial_requests:]
+            self.assertEqual(sum(message.get('method') == 'thread/resume' and
+                                 message.get('params', {}).get('threadId') == sid for message in messages), 1)
+            self.assertFalse(any(message.get('method') in ('turn/start', 'turn/steer')
+                                 or message.get('id') == 71 for message in messages))
+        finally:
+            release.set()
+            worker.join(2)
+
+    def test_late_resume_success_cannot_install_thread_after_callback_failure(self):
+        self.assert_late_attach_success_cannot_restore_failed_thread('thread/resume')
+
+    def test_late_goal_read_success_cannot_install_thread_after_callback_failure(self):
+        self.assert_late_attach_success_cannot_restore_failed_thread('thread/goal/get')
+
+    def test_unknown_or_non_string_thread_id_does_not_revoke_live_joins(self):
+        for sid in ('unknown-thread', None, 123, [], {}):
+            self.process.send({'method': 'thread/status/changed', 'params': {
+                'threadId': sid, 'status': {'type': 'idle'}}})
+        self.process.send({'method': 'thread/status/changed', 'params': {
+            'threadId': 'thread-b', 'status': {'type': 'idle'}}})
+        self.roundtrip()
+        self.assertEqual(set(self.sessions.joined), {'thread-a', 'thread-b'})
+        self.assertTrue(all(process is self.process for process in self.sessions.joined.values()))
+        self.assertEqual(self.sessions.states['thread-b']['threadRuntimeStatus']['type'], 'idle')
+        self.assertEqual(self.disconnections, [])
+        self.assert_no_unrequested_writes()
 
 
 if __name__ == '__main__':

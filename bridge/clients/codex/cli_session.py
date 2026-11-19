@@ -136,7 +136,8 @@ class CliSessions:
             self.home / 'app-server-control/app-server-control.sock', cli=cli,
             on_event=self._event, on_server_request=self._server_request,
             on_disconnect=self._disconnect, process_factory=process_factory,
-            command=command, check_socket=alias is None, client_name='codex-mobile-bridge-cli')
+            command=command, check_socket=alias is None, client_name='codex-mobile-bridge-cli',
+            on_callback_error=self._callback_error)
         self.configured_cli = cli
         self.store = RemoteStore(alias) if alias else SessionStore(self.home)
 
@@ -554,6 +555,7 @@ class CliSessions:
         with self.lock:
             if thread_id in self.joined:
                 return copy.deepcopy(self.states[thread_id])
+            process = self.client.process
         loaded = self.client.is_loaded(thread_id)
         before = self.client.request('thread/read', {'threadId': thread_id, 'includeTurns': False},
                                      replay_safe=True)['thread']
@@ -571,6 +573,8 @@ class CliSessions:
                 raise AppServerUnsupported('Saved CLI thread identity does not match this runtime')
         # Resume is explicit and sends no model, cwd, provider or permission overrides.
         with self.lock:
+            if process is None or self.client.process is not process:
+                raise AppServerUnavailable('CLI thread connection changed during join')
             self.attaching.add(thread_id)
         params = {'threadId': thread_id, 'excludeTurns': True}
         try:
@@ -602,7 +606,13 @@ class CliSessions:
             # joining the thread for turns, models and Skills.
             goal = None
         with self.lock:
-            self.joined[thread_id] = self.client.process
+            if self.client.process is not process:
+                self.attaching.discard(thread_id)
+                self.requests.pop(thread_id, None)
+                raise AppServerUnavailable('CLI thread connection changed during join')
+            if thread_id not in self.attaching:
+                raise AppServerUnavailable('CLI thread state could not be verified during join')
+            self.joined[thread_id] = process
             self.attaching.discard(thread_id)
             self.metadata[thread_id] = {'connectionToken': str(uuid.uuid4()), 'model': resumed.get('model'),
                                         'modelProvider': resumed.get('modelProvider'),
@@ -1362,7 +1372,8 @@ class CliSessions:
                 if turn:
                     item = next((item for item in turn['items'] if item.get('id') == params.get('itemId')), None)
                     if item is not None and isinstance(params.get('delta'), str):
-                        item['aggregatedOutput'] = item.get('aggregatedOutput', '') + params['delta']
+                        output = item.get('aggregatedOutput')
+                        item['aggregatedOutput'] = ('' if output is None else output) + params['delta']
             elif method in ('item/reasoning/textDelta', 'item/reasoning/summaryTextDelta'):
                 # Third-party Responses backends stream raw chain of thought and
                 # never fill `summary`; keep both streams so the phone can show
@@ -1394,6 +1405,28 @@ class CliSessions:
         self.on_state(thread_id, snapshot)
         if method == 'thread/name/updated':
             self.on_title_name(thread_id, params.get('threadName'))
+
+    def _callback_error(self, message, error, process):
+        params = message.get('params')
+        if not isinstance(params, dict):
+            return
+        thread_id = params.get('threadId')
+        if not isinstance(thread_id, str) or not thread_id:
+            return
+        with self.lock:
+            if self.client.process is not process:
+                return
+            joined = self.joined.get(thread_id) is process
+            attaching = thread_id in self.attaching
+            if attaching:
+                self.attaching.discard(thread_id)
+                self.requests.pop(thread_id, None)
+        # Revoke only the affected thread's unverified control state. Keep the
+        # shared proxy and other threads, and never reply or resume from here.
+        if joined:
+            self._invalidate(thread_id, expected_process=process)
+        elif attaching:
+            self.on_disconnect(thread_id)
 
     def _server_request(self, request):
         client = self.client

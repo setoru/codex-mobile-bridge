@@ -16,7 +16,7 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 class FixtureProcess:
-    def __init__(self, argv, **kwargs):
+    def __init__(self, argv, rpc_results=None, **kwargs):
         self.argv = argv
         request_read, request_write = os.pipe()
         response_read, response_write = os.pipe()
@@ -25,6 +25,9 @@ class FixtureProcess:
         self.requests = os.fdopen(request_read, 'rb')
         self.responses = os.fdopen(response_write, 'wb')
         self.seen = []
+        self.seen_condition = threading.Condition()
+        self.write_lock = threading.Lock()
+        self.rpc_results = rpc_results or {}
         self.handshake = threading.Event()
         self.ended = False
         self.drop = set()
@@ -33,13 +36,40 @@ class FixtureProcess:
         self.worker.start()
 
     def send(self, value):
-        self.handshake.wait(2)
         data = json.dumps(value).encode()
         header = bytes((0x81, len(data))) if len(data) < 126 else b'\x81\x7e' + struct.pack('!H', len(data))
-        self.responses.write(header + data)
-        self.responses.flush()
+        self.send_raw(header + data)
+
+    def send_raw(self, frame):
+        self.handshake.wait(2)
+        with self.write_lock:
+            self.responses.write(frame)
+            self.responses.flush()
+
+    def close_output(self):
+        with self.write_lock:
+            self.responses.close()
+
+    def wait_for_method(self, method, timeout=2):
+        with self.seen_condition:
+            return self.seen_condition.wait_for(
+                lambda: any(message.get('method') == method for message in self.seen), timeout=timeout)
 
     def serve(self):
+        try:
+            self._serve()
+        except BrokenPipeError:
+            # A transport-failure test can close the peer while a reply flushes.
+            pass
+        finally:
+            self.ended = True
+            try:
+                self.responses.close()
+            except BrokenPipeError:
+                pass
+            self.requests.close()
+
+    def _serve(self):
         header = bytearray()
         while not header.endswith(b'\r\n\r\n'):
             byte = self.requests.read(1)
@@ -67,7 +97,9 @@ class FixtureProcess:
             mask = self.requests.read(4)
             payload = self.requests.read(length)
             message = json.loads(bytes(byte ^ mask[i % 4] for i, byte in enumerate(payload)))
-            self.seen.append(message)
+            with self.seen_condition:
+                self.seen.append(message)
+                self.seen_condition.notify_all()
             if 'id' not in message or 'method' not in message:
                 continue
             method = message['method']
@@ -76,7 +108,10 @@ class FixtureProcess:
             if method in self.errors:
                 self.send({'id': message['id'], 'error': self.errors[method]})
                 continue
-            if method == 'initialize':
+            if method in self.rpc_results:
+                result = self.rpc_results[method]
+                result = result(message['params']) if callable(result) else result
+            elif method == 'initialize':
                 result = {'codexHome': '/fixture/.codex', 'platformFamily': 'unix',
                           'platformOs': 'macos', 'userAgent': 'test'}
             elif method == 'thread/loaded/list':
@@ -85,9 +120,10 @@ class FixtureProcess:
                           'nextCursor': 'page-2' if cursor is None else None}
             else:
                 result = {'ok': True}
-            self.send({'id': message['id'], 'result': result})
-        self.ended = True
-        self.responses.close()
+            try:
+                self.send({'id': message['id'], 'result': result})
+            except (OSError, ValueError):
+                break
 
     def poll(self):
         return 0 if self.ended else None
@@ -157,6 +193,124 @@ class AppServerTests(unittest.TestCase):
         with self.assertRaises(AppServerUnknownResult):
             self.client.request('turn/start', {'threadId': 'thread-a'}, timeout=.02)
         self.assertEqual(len([m for m in process.seen if m.get('method') == 'turn/start']), 1)
+        self.assertIs(self.client.process, process)
+        self.assertEqual(self.client.request('thread/read', {'threadId': 'thread-b'},
+                                             replay_safe=True), {'ok': True})
+
+    def test_callback_failure_does_not_close_connection_or_drop_following_frames(self):
+        failures = []
+        def on_event(event):
+            if event['params']['threadId'] == 'broken-thread':
+                raise TypeError('Synthetic event callback failure')
+            self.events.append(event)
+        self.client.on_event = on_event
+        self.client.on_callback_error = lambda message, error, process: failures.append((message, error, process))
+        self.client.connect()
+        process = self.processes[0]
+        bad = {'method': 'thread/status/changed', 'params': {'threadId': 'broken-thread', 'status': {'type': 'idle'}}}
+        good = {'method': 'thread/status/changed', 'params': {'threadId': 'healthy-thread', 'status': {'type': 'active'}}}
+        process.send(bad)
+        process.send(good)
+        self.assertEqual(self.client.request('thread/read', {'threadId': 'healthy-thread'},
+                                             timeout=1, replay_safe=True), {'ok': True})
+        self.assertIs(self.client.process, process)
+        self.assertIsNone(process.poll())
+        self.assertEqual(self.events, [good])
+        self.assertEqual(len(failures), 1)
+        self.assertEqual(failures[0][0], bad)
+        self.assertIsInstance(failures[0][1], TypeError)
+        self.assertIs(failures[0][2], process)
+
+    def test_server_request_callback_failure_does_not_reply_or_replay(self):
+        failures = []
+        def on_request(request):
+            raise ValueError('Synthetic server request callback failure')
+        self.client.on_server_request = on_request
+        self.client.on_callback_error = lambda message, error, process: failures.append((message, error, process))
+        self.client.connect()
+        process = self.processes[0]
+        request = {'id': 71, 'method': 'item/commandExecution/requestApproval',
+                   'params': {'threadId': 'thread-a', 'turnId': 'turn-a'}}
+        process.send(request)
+        good = {'method': 'thread/status/changed', 'params': {'threadId': 'thread-b', 'status': {'type': 'idle'}}}
+        process.send(good)
+        self.assertEqual(self.client.request('thread/read', {'threadId': 'thread-b'},
+                                             timeout=1, replay_safe=True), {'ok': True})
+        self.assertIs(self.client.process, process)
+        self.assertEqual(self.events, [good])
+        self.assertFalse(any(message.get('id') == 71 for message in process.seen))
+        self.assertEqual(len(failures), 1)
+        self.assertEqual(failures[0][0], request)
+        self.assertIsInstance(failures[0][1], ValueError)
+
+    def test_error_hook_failure_preserves_reader_and_redacts_private_data(self):
+        private_marker = 'synthetic-private-token'
+        callback_text = 'Synthetic callback detail: ' + private_marker
+        hook_text = 'Synthetic hook detail: ' + private_marker
+        def on_event(event):
+            if event['params']['threadId'] == 'broken-thread':
+                raise ValueError(callback_text)
+            self.events.append(event)
+        def on_error(message, error, process):
+            raise RuntimeError(hook_text)
+        self.client.on_event, self.client.on_callback_error = on_event, on_error
+        self.client.connect()
+        process = self.processes[0]
+        with self.assertLogs('bridge.clients.codex.app_server', level='WARNING') as captured:
+            process.send({'method': 'thread/status/changed', 'params': {
+                'threadId': 'broken-thread', 'status': {'type': 'active'}, 'private': private_marker}})
+            good = {'method': 'thread/status/changed', 'params': {
+                'threadId': 'healthy-thread', 'status': {'type': 'idle'}}}
+            process.send(good)
+            self.assertEqual(self.client.request('thread/read', {'threadId': 'healthy-thread'},
+                                                 timeout=1, replay_safe=True), {'ok': True})
+        self.assertIs(self.client.process, process)
+        self.assertIsNone(process.poll())
+        self.assertEqual(self.events, [good])
+        logged = '\n'.join(captured.output)
+        for private in (private_marker, callback_text, hook_text):
+            self.assertNotIn(private, logged)
+        self.assertIn('ValueError', logged)
+        self.assertIn('RuntimeError', logged)
+        self.assertTrue(all(record.exc_info is None for record in captured.records))
+
+    def assert_transport_failure_closes_unknown_write(self, fail_transport):
+        disconnected = threading.Event()
+        callback_errors = []
+        self.client.on_disconnect = disconnected.set
+        self.client.on_callback_error = lambda *args: callback_errors.append(args)
+        self.client.connect()
+        process = self.processes[0]
+        process.drop.add('turn/start')
+        outcome = []
+        def send_write():
+            try:
+                self.client.request('turn/start', {'threadId': 'thread-a'}, timeout=2)
+            except Exception as error:
+                outcome.append(error)
+        worker = threading.Thread(target=send_write)
+        worker.start()
+        try:
+            self.assertTrue(process.wait_for_method('turn/start'))
+            fail_transport(process)
+            worker.join(2)
+            self.assertFalse(worker.is_alive())
+            self.assertTrue(disconnected.wait(2))
+            self.assertEqual(len(outcome), 1)
+            self.assertIsInstance(outcome[0], AppServerUnknownResult)
+            self.assertIsNone(self.client.process)
+            self.assertEqual(sum(message.get('method') == 'turn/start' for message in process.seen), 1)
+            self.assertEqual(callback_errors, [])
+        finally:
+            self.client.close()
+            worker.join(2)
+
+    def test_pipe_eof_still_closes_connection_and_does_not_replay_unknown_write(self):
+        self.assert_transport_failure_closes_unknown_write(lambda process: process.close_output())
+
+    def test_invalid_frame_still_closes_connection_and_does_not_replay_unknown_write(self):
+        # A masked server frame violates the transport contract, before callbacks.
+        self.assert_transport_failure_closes_unknown_write(lambda process: process.send_raw(b'\x81\x80'))
 
     def test_delete_maps_only_known_native_rejection_without_replay(self):
         from bridge.features.sessions.create import CreationError, DeleteRejected
