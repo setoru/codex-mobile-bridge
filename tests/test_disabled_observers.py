@@ -11,6 +11,7 @@ from bridge.clients.manager import DesktopSessions
 from bridge.features.notifications.channels import Notifications
 from bridge.clients.codex.catalog import Catalog
 from bridge.features.accounts.monitor import AccountMonitor
+from bridge.features.sessions.auto_titles import AutomaticTitles
 import test_bridge as support
 
 
@@ -161,6 +162,12 @@ class DisabledObserversTests(unittest.TestCase):
         bridge.ipc = Mock(connect_lock=threading.RLock())
         bridge.remote_bridges = {'ssh:test': Mock()}
         bridge.cli_sessions = Mock()
+        bridge.lock = threading.RLock()
+        bridge._auto_title_targets = {}
+        title_runner = Mock(side_effect=AssertionError('No eligible title chat exists in this fixture'))
+        bridge.auto_titles = AutomaticTitles(self.temp.name, title_runner)
+        self.addCleanup(bridge.auto_titles.close)
+        self.addCleanup(title_runner.assert_not_called)
         bridge.suspend_observation()
         bridge.ipc.close.assert_called_once_with()
         bridge.remote_bridges['ssh:test'].suspend_observation.assert_called_once_with()

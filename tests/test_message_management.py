@@ -11,8 +11,17 @@ from unittest.mock import Mock, patch
 
 from bridge.app.service import Bridge, LiveSession
 from bridge.features.endpoints.wsl import WslEntry, Session
+from bridge.features.sessions.auto_titles import AutomaticTitles
 
 ROOT = Path(__file__).resolve().parents[1]
+
+
+def inert_title_jobs(test):
+    runner = Mock(side_effect=AssertionError('No eligible title chat exists in this fixture'))
+    jobs = AutomaticTitles(test.temp.name, runner)
+    test.addCleanup(jobs.close)
+    test.addCleanup(runner.assert_not_called)
+    return jobs
 
 
 class MessageManagementTests(unittest.TestCase):
@@ -26,6 +35,7 @@ class MessageManagementTests(unittest.TestCase):
         b = Bridge.__new__(Bridge)
         b.host = 'local'; b.accounts = None; b.question_skips = None
         b.lock = threading.RLock(); b.submit_lock = threading.Lock(); b.goal_lock = threading.RLock()
+        b.auto_titles = inert_title_jobs(self); b._auto_title_targets = {}
         b.live = {self.thread: LiveSession(self.thread)}; b.goal_commands = {}
         b.ledger_path = Path(self.temp.name)/'submissions.json'
         b.submissions = {self.thread+':'+i: {'text': i, 'status': 'queued', 'mode': 'queue', 'at': n}
@@ -41,6 +51,7 @@ class MessageManagementTests(unittest.TestCase):
         b = WslEntry.__new__(WslEntry)
         b.host='wsl:fixture'; b.lock=threading.RLock(); b.write_lock=threading.RLock()
         b.closed=threading.Event(); b._draft_identity_pending=set(); b.live={self.thread:Session(self.thread)}
+        b.auto_titles=inert_title_jobs(self); b._auto_title_targets={}
         b.receipts_path=Path(self.temp.name)/'operations.json'
         b.receipts={self.thread+':send:'+i: {'entry':{'text':i,'mode':'queue'},'result':{'id':i,'status':'queued'}} for i in self.ids[:3]}
         b._management_identity=Mock(return_value='account-a')

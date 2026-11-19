@@ -589,7 +589,15 @@ class WslSessionTests(unittest.TestCase):
         self.assertTrue(view['access']['canChangePermissions'])
         self.assertFalse(any(m == 'thread/resume' for m, _ in self.entry.server.calls))
         identifier = str(uuid.uuid4())
-        result = self.entry.send(self.identifier, 'synthetic input', identifier, work_mode='default')
+        refreshed = threading.Event()
+        refresh = self.entry._refresh_background
+        def complete_refresh(session):
+            try:
+                refresh(session)
+            finally:
+                refreshed.set()
+        with patch.object(self.entry, '_refresh_background', side_effect=complete_refresh):
+            result = self.entry.send(self.identifier, 'synthetic input', identifier, work_mode='default')
         self.assertEqual(result['status'], 'accepted')
         writes = [p for m, p in self.entry.server.calls if m == 'turn/start']
         self.assertEqual(writes, [{'threadId': self.identifier,
@@ -600,6 +608,8 @@ class WslSessionTests(unittest.TestCase):
                          [{'threadId': self.identifier, 'excludeTurns': True}])
         self.assertEqual(self.entry.send(self.identifier, 'synthetic input', identifier, work_mode='default'), result)
         self.assertEqual(sum(m == 'turn/start' for m, _ in self.entry.server.calls), 1)
+        # Let the real refresh finish before cleanup closes its native runtime.
+        self.assertTrue(refreshed.wait(2), 'background refresh did not finish before fixture cleanup')
 
     def test_fresh_not_loaded_evidence_blocks_even_when_display_says_connected(self):
         session = self.entry.session(self.identifier)

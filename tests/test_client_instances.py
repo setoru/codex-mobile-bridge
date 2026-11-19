@@ -12,6 +12,7 @@ from unittest.mock import Mock, patch
 from bridge.clients.profiles import NativeProfile, resolve_profile
 from bridge.features.clients.instances import Instances, instance_id
 from bridge.features.endpoints.registry import Entries, local_entry_id
+from bridge.features.sessions.auto_titles import AutomaticTitles
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -267,6 +268,10 @@ class DelegatedCodexInstancesTests(unittest.TestCase):
                 submissions={},creations={},message_actions={},goal_commands={},terminals=SimpleNamespace(lock=threading.RLock(),jobs={},sessions={}),
                 cli_sessions=SimpleNamespace(cli_connections=lambda:[]),side_chats=SimpleNamespace(lock=threading.RLock(),chats={}),
                 accounts=SimpleNamespace(lock=threading.RLock(),enrollment=None))
+            title_runner=Mock(side_effect=AssertionError('No eligible title chat exists in this fixture'))
+            owner.auto_titles=AutomaticTitles(root/'gateway',title_runner)
+            self.addCleanup(owner.auto_titles.close)
+            self.addCleanup(title_runner.assert_not_called)
             owner.assert_detachable=functools.partial(Bridge.assert_detachable,owner);owner.close=Mock()
             entries=Entries(root/'gateway',local_factory=lambda row,directory:owner)
             registry=Instances(root/'gateway',codex=entries)

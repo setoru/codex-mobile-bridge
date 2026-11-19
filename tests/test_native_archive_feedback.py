@@ -76,13 +76,15 @@ class ArchiveFeedback(unittest.TestCase):
 
     def test_daemon_and_wsl_channels_keep_explicit_error_separate_from_disconnect(self):
         client = CodexAppServer(self.root / 'control.sock')
-        def send(packet):
+        def send(packet, *, expected_connection=None, current_guard=None):
             client.pending[packet['id']].set_result({'error': {'code': -32601, 'message': 'unsupported'}})
         client._send = send
         with self.assertRaises(ArchiveRejected) as caught: client.request('thread/archive', {'threadId': self.sid})
         self.assertEqual(caught.exception.reason, 'unsupported')
         shared = SharedServer(Mock())
-        shared.write = lambda packet: shared.pending[packet['id']].set_result({'error': {'code': -32600, 'message': 'active writer'}})
+        def write(packet, *, current_guard=None):
+            shared.pending[packet['id']].set_result({'error': {'code': -32600, 'message': 'active writer'}})
+        shared.write = write
         with self.assertRaises(ArchiveRejected): shared.request('thread/archive', {'threadId': self.sid})
 
     def test_archive_flags_cover_full_subtree_without_reading_rollouts(self):

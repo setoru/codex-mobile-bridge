@@ -17,6 +17,7 @@ from bridge.features.sessions.identity import same_cwd
 from bridge.clients.codex.app_server import (
     AppServerError, AppServerUnavailable, AppServerUnknownResult, AppServerUnsupported, CodexAppServer)
 from bridge.clients.codex.catalog import Catalog, CatalogError, ModelStore, normalize_native_skills
+from bridge.clients.codex.title_generation import TitleCancelled, TitleContext, TitleError, TitleGenerator
 from bridge.clients.codex.remote import RemoteStore, RemoteUnavailable, remote_model_catalog, remote_model_identity
 from bridge.platforms.codex_daemon_env import read_daemon_environment, DaemonEnvironmentUnavailable
 from bridge.features.sessions.goal import GoalError, GoalUnavailable, GoalUnsupported, normalize_goal_result
@@ -129,6 +130,8 @@ class CliSessions:
         self.refreshing = set()
         self.refresh_pending = set()
         self.refresh_cancel = {}
+        self.title_generator = TitleGenerator()
+        self.on_title_name = lambda identifier, name: None
         self.client = CodexAppServer(
             self.home / 'app-server-control/app-server-control.sock', cli=cli,
             on_event=self._event, on_server_request=self._server_request,
@@ -136,6 +139,147 @@ class CliSessions:
             command=command, check_socket=alias is None, client_name='codex-mobile-bridge-cli')
         self.configured_cli = cli
         self.store = RemoteStore(alias) if alias else SessionStore(self.home)
+
+    def title_target(self, identifier):
+        """Capture the sending connection before an automatic title is queued."""
+        with self.lock:
+            client = self.client
+            process = client.process
+            metadata = self.metadata.get(identifier) or {}
+            state = self.states.get(identifier) or {}
+            if process is None or self.joined.get(identifier) is not process or not metadata.get('connectionToken'):
+                return None
+            return {'client': client, 'process': process, 'transport': getattr(client, 'transport', None),
+                    'token': metadata['connectionToken'], 'nameRevision': metadata.get('nameRevision', 0),
+                    'cwd': state.get('cwd') or metadata.get('cwd'), 'provider': metadata.get('modelProvider'),
+                    'permissions': copy.deepcopy(state.get('currentPermissions') or metadata.get('permissions') or {}),
+                    'home': self.remote_home if self.alias is not None else self.home}
+
+    def run_title(self, job, text, cancelled, progress, *, target, apply_guard, operate, source_current):
+        """Generate and save one title using only this thread's sending connection."""
+        identifier = job['threadId']
+        identity = job['identity']
+        if target is None:
+            raise TitleCancelled('原 CLI 命名连接未确认')
+        client, process, transport = target['client'], target['process'], target['transport']
+        token, name_revision, home = target['token'], target['nameRevision'], target['home']
+        with self.lock:
+            if (process is None or self.joined.get(identifier) is not process or not token or home is None or
+                    self.client is not client or client.process is not process or
+                    getattr(client, 'transport', None) is not transport or
+                    self.metadata.get(identifier, {}).get('connectionToken') != token or
+                    str(home) != identity.get('home') or
+                    target['provider'] != identity.get('modelProvider') or
+                    not same_cwd(target['cwd'], identity.get('cwd'), self.alias is None and os.name == 'nt')):
+                raise TitleCancelled('原 CLI 命名接入已变化')
+
+        def current(*, source=True):
+            if source and not source_current():
+                raise TitleCancelled('原 CLI 聊天已由其他执行器接管')
+            with self.lock:
+                if (self.client is not client or client.process is not process or
+                        getattr(client, 'transport', None) is not transport):
+                    raise TitleCancelled('原 CLI 命名连接已变化')
+                if source and (self.joined.get(identifier) is not process or
+                        self.metadata.get(identifier, {}).get('connectionToken') != token):
+                    raise TitleCancelled('原 CLI 聊天连接已释放')
+
+        def request(method, params, *, timeout=20):
+            # Cleanup owns a known temporary ID, so it can finish after the
+            # source subscription is released, but never on a new transport.
+            cleanup = method in ('thread/unsubscribe', 'turn/interrupt') and params.get('threadId') != identifier
+            def send_guard():
+                current(source=not cleanup)
+                if not cleanup and cancelled.is_set():
+                    return False
+                if method in ('thread/start', 'turn/start', 'thread/name/set'):
+                    with self.lock:
+                        if self.metadata.get(identifier, {}).get('nameRevision', 0) != name_revision:
+                            return False
+                return True
+            def call():
+                current(source=not cleanup)
+                options = {'timeout': timeout, 'replay_safe': method.endswith(('/read', '/list'))}
+                options['current_guard'] = send_guard
+                if isinstance(client, CodexAppServer):
+                    options['expected_connection'] = (process, transport)
+                result = client.request(method, params, **options)
+                current(source=not cleanup)
+                return result
+            # This private callback is used by the title protocol only for
+            # its known temporary ID. Revoking access must still allow that
+            # task's cleanup, with the original transport checked at send.
+            return call() if cleanup else operate(call)
+
+        def respond(request_id, *, result=None, error=None):
+            def call():
+                current(source=False)
+                options = {'result': result, 'error': error}
+                if isinstance(client, CodexAppServer):
+                    options['expected_connection'] = (process, transport)
+                    options['current_guard'] = lambda: current(source=False) is None
+                return client.respond(request_id, **options)
+            return operate(call)
+
+        def save_name(title, cancel):
+            with apply_guard:
+                if cancel.is_set():
+                    return False
+                current()
+                with self.lock:
+                    if self.metadata.get(identifier, {}).get('nameRevision', 0) != name_revision:
+                        return False
+                source = request('thread/read', {'threadId': identifier, 'includeTurns': False}).get('thread') or {}
+                if (source.get('id') != identifier or source.get('status', {}).get('type') == 'notLoaded' or
+                        not same_cwd(identity['cwd'], source.get('cwd'), self.alias is None and os.name == 'nt') or
+                        source.get('modelProvider') != identity['modelProvider'] or source.get('name')):
+                    return False
+                with self.lock:
+                    if cancel.is_set() or self.metadata.get(identifier, {}).get('nameRevision', 0) != name_revision:
+                        return False
+                try:
+                    request('thread/name/set', {'threadId': identifier, 'name': title})
+                except AppServerUnknownResult as error:
+                    raise TitleError('原生自动名称写入结果未知', unknown=True) from error
+                try:
+                    saved = request('thread/read', {'threadId': identifier, 'includeTurns': False}).get('thread') or {}
+                except (AppServerError, TitleError) as error:
+                    raise TitleError('原生自动名称尚未确认', unknown=True) from error
+                if (saved.get('id') != identifier or saved.get('modelProvider') != identity['modelProvider'] or
+                        not same_cwd(identity['cwd'], saved.get('cwd'), self.alias is None and os.name == 'nt') or
+                        saved.get('name') != title):
+                    raise TitleError('原生自动名称尚未确认', unknown=True)
+                with self.lock:
+                    if cancel.is_set():
+                        return False
+                    latest = self.metadata.get(identifier) or {}
+                    if latest.get('nameRevision', 0) != name_revision and latest.get('threadName') != title:
+                        # A name event can update native state before its
+                        # publication reaches the cancellation callback.
+                        return False
+                    current_state = self.states.get(identifier)
+                    if current_state is not None:
+                        current_state['threadName'] = title
+                        current_state['title'] = title
+                        snapshot = copy.deepcopy(current_state)
+                    else:
+                        snapshot = None
+                if snapshot is not None:
+                    self.on_state(identifier, snapshot)
+                return True
+
+        def apply(title, cancel):
+            # Account/entry gates precede the source action lock, matching
+            # manual rename and release. Native result waiting holds neither.
+            return operate(lambda: save_name(title, cancel))
+
+        permissions = target['permissions']
+        profile = permissions.get('activePermissionProfile')
+        profile = profile.get('id') if isinstance(profile, dict) else profile
+        context = TitleContext(identifier, target['cwd'], identity['modelProvider'],
+                               (id(client), id(process), id(transport)), request, respond, apply, profile,
+                               matches_cwd=lambda left, right: same_cwd(left, right, self.alias is None and os.name == 'nt'))
+        return self.title_generator.run(context, text, cancelled=cancelled, progress=progress)
 
     def cli_connections(self):
         with self.lock:
@@ -1088,6 +1232,9 @@ class CliSessions:
             raise AppServerUnavailable('CLI thread identity changed before the operation')
 
     def _event(self, event):
+        client = self.client
+        if self.title_generator.consume(event, (id(client), id(client.process), id(getattr(client, 'transport', None)))):
+            return
         method = event.get('method')
         params = event.get('params') or {}
         thread_id = params.get('threadId')
@@ -1245,8 +1392,13 @@ class CliSessions:
                 return
             snapshot = copy.deepcopy(state)
         self.on_state(thread_id, snapshot)
+        if method == 'thread/name/updated':
+            self.on_title_name(thread_id, params.get('threadName'))
 
     def _server_request(self, request):
+        client = self.client
+        if self.title_generator.consume(request, (id(client), id(client.process), id(getattr(client, 'transport', None)))):
+            return
         thread_id = (request.get('params') or {}).get('threadId')
         with self.lock:
             if thread_id not in self.joined and thread_id not in self.attaching:
@@ -1315,6 +1467,7 @@ class CliSessions:
         threading.Thread(target=run, daemon=True).start()
 
     def _disconnect(self):
+        self.title_generator.disconnect()
         with self.lock:
             for cancel in self.refresh_cancel.values():
                 cancel.set()

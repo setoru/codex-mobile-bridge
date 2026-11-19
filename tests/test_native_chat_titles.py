@@ -8,7 +8,7 @@ from types import SimpleNamespace
 from unittest.mock import Mock
 
 from bridge.app.service import Bridge
-from bridge.clients.codex.app_server import AppServerUnknownResult
+from bridge.clients.codex.app_server import AppServerUnknownResult, AppServerUnsupported
 from bridge.clients.codex.ipc import IPCError
 from bridge.features.endpoints.registry import entry_id
 from bridge.features.endpoints.wsl import WslEntry
@@ -18,6 +18,7 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 class NativeRuntime:
+    """Legacy native I/O for title synchronization, without structured naming config."""
     def __init__(self, home):
         self.home = home
         self.socket_path = str(home / 'fixture.sock')
@@ -59,7 +60,7 @@ class NativeRuntime:
             self.threads[params['threadId']]['name'] = params['name']
             return {}
         if method == 'config/read':
-            return {'config': {'model_provider': 'fixture-provider', 'model': 'fixture-model'}}
+            raise AppServerUnsupported('Synthetic legacy runtime has no effective configuration interface')
         if method == 'thread/goal/get':
             return {'goal': None}
         raise AssertionError('Unexpected native operation: ' + method)
@@ -118,7 +119,7 @@ class ChatFixture:
 
 
 class NativeChatTitleTests(unittest.TestCase):
-    def test_unnamed_creation_and_first_send_keep_one_thread_and_use_native_titles(self):
+    def test_legacy_runtime_keeps_first_send_and_synchronizes_native_titles(self):
         for surface in ('cli', 'wsl'):
             with self.subTest(surface=surface):
                 fixture = ChatFixture(self, surface)

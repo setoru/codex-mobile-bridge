@@ -2,6 +2,7 @@
 import copy
 import hashlib
 import json
+import logging
 import posixpath
 import threading
 import time
@@ -17,6 +18,7 @@ from bridge.clients.codex.remote import RemoteStore, RemoteUnavailable, payload,
 from bridge.clients.codex.shared_server import SharedServer
 from bridge.clients.codex.configuration import magpie_managed
 from bridge.clients.codex.catalog import Catalog, normalize_native_skills
+from bridge.clients.codex.title_generation import TitleCancelled, TitleContext, TitleError, TitleGenerator
 from bridge.features.sessions import linux_permissions
 from bridge.features.accounts.draft_identity import draft_identity
 from bridge.features.sessions.model import normalize_state, normalize_request, computer_use_approval
@@ -26,6 +28,7 @@ from bridge.features.sessions.directory_grouping import directory_group
 from bridge.features.sessions.archive import ArchiveCommands
 from bridge.features.sessions.organization_commands import OrganizationCommands
 from bridge.features.sessions.compaction import CompactCommands
+from bridge.features.sessions.auto_titles import AutomaticTitles, title_input
 from bridge.features.sessions.create import check_archive_runtime
 from bridge.features.sessions.recovery import RecoveryCommands
 from bridge.features.sessions.pins import SessionPins
@@ -140,6 +143,9 @@ class WslEntry(WslFeatures):
         self.uploads = Uploads(self.data_dir, lambda *args: upload_file(self.row['distribution'], *args, reader=self.read))
         self._init_features()
         self.model_catalog = WslModelCatalog(self)
+        self.title_generator = TitleGenerator()
+        self._auto_title_targets = {}
+        self.auto_titles = AutomaticTitles(self.data_dir, self._run_auto_title)
         self.worker = threading.Thread(target=self._maintain, daemon=True)
         self.worker.start()
 
@@ -175,6 +181,9 @@ class WslEntry(WslFeatures):
                     raise IPCError('WSL 入口已关闭')
                 generation = uuid.uuid4().hex
                 server = SharedServer(stream, lambda event: self._event(event, generation))
+                self.title_generator.disconnect(self.generation)
+                self.auto_titles.cancel_all()
+                self._auto_title_targets.clear()
                 self.generation = generation
                 self.subscriptions.clear()
                 with self.lock:
@@ -193,10 +202,15 @@ class WslEntry(WslFeatures):
                 raise IPCError('无法连接 WSL Codex 共享服务，请检查版本、发行版状态或其他独立运行的 Codex') from exc
 
     def _event(self, message, generation):
+        if self.title_generator.consume(message, generation):
+            return
         if generation != self.generation:
             return
         method, params = message.get('method'), message.get('params') or {}
         if method == 'bridge/disconnected':
+            self.title_generator.disconnect(generation)
+            self.auto_titles.cancel_all()
+            self._auto_title_targets.clear()
             with self.lock:
                 sessions = list(self.live.values())
             for session in sessions:
@@ -256,11 +270,14 @@ class WslEntry(WslFeatures):
             elif method == 'thread/status/changed':
                 session.state['threadRuntimeStatus'] = copy.deepcopy(params.get('status') or {})
             elif method == 'thread/closed':
+                self.auto_titles.cancel(session.id)
                 self.subscriptions.pop(session.id, None)
                 session.connected = False
                 session.state['requests'] = []
                 session.error = 'WSL 会话已卸载，点击重新连接即可恢复'
             session.changed()
+        if method == 'thread/name/updated':
+            self.auto_titles.observe_name(session.id, name)
 
     def _refresh(self, session):
         with session.action_lock:
@@ -726,6 +743,7 @@ class WslEntry(WslFeatures):
                         or self.subscriptions.get(identifier) != generation or self.subscription_tokens.get(identifier) != token):
                     raise IPCError('原 WSL CLI 连接已变化；未操作新的连接')
                 return runtime.request(method, params)
+            self.auto_titles.cancel(identifier)
             queued = [entry for key, entry in self.receipts.items() if key.startswith(identifier + ':send:')
                       and entry.get('result', {}).get('status') in ('queued', 'unknown')]
             if queued:
@@ -870,7 +888,7 @@ class WslEntry(WslFeatures):
                     source += source_text('features/sessions/create.py')
                     source += '\nprint(json.dumps(project_directory(**' + payload({'value': project['cwd'], 'expected': project.get('directoryIdentity')}) + ')))\n'
                 cwd = self.read(self.row['distribution'], source)['cwd']
-                receipt = {'project': project_key, 'title': title, 'cwd': cwd}
+                receipt = {'project': project_key, 'title': title, 'cwd': cwd, 'autoTitle': not bool(title)}
                 if model_options:
                     receipt['modelOptions'] = model_options
 
@@ -890,6 +908,8 @@ class WslEntry(WslFeatures):
                         raise
                     raise IPCError('创建结果待核对，请先刷新聊天列表；不会重复创建') from None
             self.activate(identifier)
+            if receipt.get('autoTitle'):
+                self._arm_auto_title(identifier, request_id)
             return {'id': identifier, 'host': self.host, 'opened': True, 'message': '聊天已创建，可以直接发送消息'}
 
     def _create_native_chat(self, runtime, cwd, options, *, on_start, on_created, title=''):
@@ -943,6 +963,161 @@ class WslEntry(WslFeatures):
         self.data_dir.mkdir(parents=True, exist_ok=True)
         private_json(self.creations_path, self.creations)
 
+    def _arm_auto_title(self, identifier, creation_id):
+        if self.auto_titles.status(identifier) is not None:
+            return
+        session = self.live.get(identifier)
+        if session is None:
+            return
+        with session.condition:
+            state = session.state
+            if not session.connected or state.get('threadName'):
+                return
+            identity = {'host': self.host, 'home': self.row['home'], 'cwd': state.get('cwd'),
+                        'modelProvider': state.get('modelProvider')}
+        try:
+            self.auto_titles.arm(identifier, creation_id, identity)
+        except (OSError, ValueError):
+            logging.getLogger(__name__).warning('Automatic WSL title registration unavailable')
+
+    def _auto_title_target(self, identifier, runtime):
+        if (self.auto_titles.status(identifier) or {}).get('status') != 'armed':
+            return None
+        session = self.live.get(identifier)
+        if session is None:
+            return None
+        with session.condition:
+            route = self._managed_routes.get(identifier)
+            return (runtime, self.generation, self.subscription_tokens.get(identifier),
+                    session.name_revision, route[:-1] if route is not None else None)
+
+    def _accept_auto_title(self, identifier, submission_id, text, binding):
+        if binding is None:
+            return
+        if (self.auto_titles.status(identifier) or {}).get('status') != 'armed':
+            return
+        # A previously uncertain submission may already be the first native
+        # message. A later acknowledgment cannot authorize a second title job.
+        key = identifier + ':send:' + submission_id
+        if any(previous != key and previous.startswith(identifier + ':send:') and
+               receipt.get('result', {}).get('status') in ('accepted', 'unknown')
+               for previous, receipt in self.receipts.items()):
+            self.auto_titles.cancel(identifier)
+            return
+        runtime, generation, token, *_ = binding
+        if (self.server is not runtime or runtime.closed or self.generation != generation or token is None or
+                self.subscriptions.get(identifier) != generation or self.subscription_tokens.get(identifier) != token):
+            self.auto_titles.cancel(identifier)
+            return
+        self._auto_title_targets[identifier] = binding
+        if not self.auto_titles.accepted(identifier, submission_id, text):
+            self._auto_title_targets.pop(identifier, None)
+
+    def _run_auto_title(self, job, text, cancelled, progress):
+        identifier, identity = job['threadId'], job['identity']
+        binding = self._auto_title_targets.get(identifier)
+        session = self.live.get(identifier)
+        if binding is None or session is None:
+            raise TitleCancelled('原 WSL 命名连接已失效')
+        runtime, generation, token, name_revision, route = binding
+
+        def current(*, source=True):
+            current_route = self._managed_routes.get(identifier)
+            connection = (not self.closed.is_set() and self.server is runtime and not runtime.closed and
+                          self.generation == generation and identity.get('host') == self.host and
+                          identity.get('home') == self.row['home'])
+            return connection and (not source or (
+                    self.subscriptions.get(identifier) == generation and token is not None and
+                    self.subscription_tokens.get(identifier) == token and
+                    self.live.get(identifier) is session and session.connected and
+                    session.state.get('cwd') == identity.get('cwd') and
+                    session.state.get('modelProvider') == identity.get('modelProvider') and
+                    (current_route[:-1] if current_route is not None else None) == route))
+
+        def require_current(*, source=True):
+            if not current(source=source):
+                raise TitleCancelled('原 WSL 命名会话身份或连接已变化')
+
+        def request(method, params, *, timeout):
+            cleanup = method in ('thread/unsubscribe', 'turn/interrupt') and params.get('threadId') != identifier
+            with self.write_lock:
+                require_current(source=not cleanup)
+                guard = lambda: current(source=not cleanup) and (not cancelled.is_set() or cleanup)
+                result = runtime.request(method, params, timeout=timeout, current_guard=guard)
+                require_current(source=not cleanup)
+                if method == 'thread/read' and params.get('threadId') == identifier:
+                    source = result.get('thread') or {}
+                    self._verify_thread(identifier, {'cwd': identity.get('cwd'),
+                                                     'model_provider': identity.get('modelProvider')}, source)
+                    self._check_account_route(runtime, source)
+                    require_current()
+                return result
+
+        def respond(request_id, *, result=None, error=None):
+            with self.write_lock:
+                require_current(source=False)
+                return runtime.respond(request_id, result=result, error=error,
+                                       current_guard=lambda: current(source=False))
+
+        def apply(title, cancelled):
+            def name_current():
+                with session.condition:
+                    return (current() and not cancelled.is_set() and session.name_revision == name_revision and
+                            not session.state.get('threadName'))
+
+            with self.write_lock, session.action_lock:
+                require_current()
+                if cancelled.is_set():
+                    return False
+                try:
+                    original = runtime.request('thread/read', {'threadId': identifier, 'includeTurns': False},
+                                               current_guard=current)['thread']
+                    self._verify_thread(identifier, {'cwd': identity.get('cwd'),
+                                                     'model_provider': identity.get('modelProvider')}, original)
+                    self._check_account_route(runtime, original)
+                except (IPCError, RemoteUnavailable, KeyError) as error:
+                    raise TitleCancelled('原 WSL 命名身份尚未确认，名称未发送') from error
+                with session.condition:
+                    if original.get('name') or session.name_revision != name_revision or cancelled.is_set():
+                        return False
+                require_current()
+                try:
+                    runtime.request('thread/name/set', {'threadId': identifier, 'name': title},
+                                    current_guard=name_current)
+                except Exception as error:
+                    if getattr(error, 'not_sent', False):
+                        raise TitleCancelled('原 WSL 命名连接已变化，名称未发送') from error
+                    raise TitleError('自动名称写入结果尚未确认',
+                                     unknown=not bool(getattr(error, 'rpc_error', None))) from error
+                try:
+                    saved = runtime.request('thread/read', {'threadId': identifier, 'includeTurns': False},
+                                            current_guard=current)['thread']
+                except Exception as error:
+                    raise TitleError('自动名称写入结果尚未确认', unknown=True) from error
+                self._verify_thread(identifier, {'cwd': identity.get('cwd'),
+                                                 'model_provider': identity.get('modelProvider')}, saved)
+                if saved.get('name') != title or cancelled.is_set():
+                    return False
+                with session.condition:
+                    session.name_revision += 1
+                    session.name_generation = generation
+                    session.state.update(threadName=title, title=title)
+                    session.changed()
+                return True
+
+        with self.write_lock:
+            require_current()
+            with session.condition:
+                profile = (session.state.get('currentPermissions') or {}).get('activePermissionProfile') or {}
+                profile_id = profile.get('id') if isinstance(profile, dict) else None
+        context = TitleContext(identifier, identity['cwd'], identity['modelProvider'], generation,
+                               request, respond, apply, permission_profile=profile_id)
+        try:
+            return self.title_generator.run(context, text, cancelled=cancelled, progress=progress)
+        finally:
+            if self._auto_title_targets.get(identifier) is binding:
+                self._auto_title_targets.pop(identifier, None)
+
     def recover(self, identifier, body=None, *, request_id=None):
         self._require_open()
         if body is None:
@@ -992,6 +1167,7 @@ class WslEntry(WslFeatures):
                 raise IPCError('新会话连接尚未确认，请在新聊天重新连接')
             if overrides:
                 verify_creation_settings(session.state, overrides, cwd)
+        self._arm_auto_title(identifier, entry['operationId'])
         return {'ready': True, 'opened': True, 'message': '聊天已创建，可以直接发送消息',
                 'draftAccountIdentity': self._management_identity(identifier, refresh=True)}
 
@@ -1122,7 +1298,15 @@ class WslEntry(WslFeatures):
             # Check immediately before creating an uncertain write receipt. A
             # known route rejection has not sent model bytes and stays retryable.
             self._check_account_route(runtime, thread)
-            result = self._mutation(identifier, key, value, dispatch)
+            title_target = self._auto_title_target(identifier, runtime) if mode != 'steer' else None
+            try:
+                result = self._mutation(identifier, key, value, dispatch)
+            except Exception:
+                if mode != 'steer' and (self.auto_titles.status(identifier) or {}).get('status') == 'armed':
+                    self.auto_titles.cancel(identifier)
+                raise
+            if mode != 'steer' and result.get('status') == 'accepted':
+                self._accept_auto_title(identifier, submission_id, title_input(text, files), title_target)
             self.session(identifier, background=True)
             return result
 
@@ -1514,7 +1698,9 @@ class WslEntry(WslFeatures):
         if not isinstance(title, str) or not title.strip() or len(title) > 120 or any(ord(c) < 32 for c in title):
             raise ValueError('聊天名称需为 1–120 个字符，不能包含控制字符')
         self.store.get(identifier)
-        self.runtime().request('thread/name/set', {'threadId': identifier, 'name': title.strip()})
+        self.auto_titles.cancel(identifier)
+        with self.session(identifier, attach=False).action_lock:
+            self.runtime().request('thread/name/set', {'threadId': identifier, 'name': title.strip()})
         return {'id': identifier, 'title': title.strip(), 'host': self.host}
 
     @_entry_write
@@ -1590,9 +1776,12 @@ class WslEntry(WslFeatures):
     def close(self):
         with self.write_lock:
             self.closed.set()
+            self.title_generator.disconnect()
+            self.auto_titles.cancel_all()
             self._close_features()
             self.model_catalog.close()
             server = self.server
             if server is not None:
                 server.close()
+        self.auto_titles.close()
         self.worker.join(timeout=3)

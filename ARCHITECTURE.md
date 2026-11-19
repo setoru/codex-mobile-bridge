@@ -4,7 +4,7 @@
 
 ## 目标与执行边界
 
-手机网页控制 Codex App 聊天，并可在已保存项目中新建空聊天。Codex 页面内的 WSL 接入支持直接创建及恢复原生线程；明确创建或继续时可用已安装 Codex 的原生 daemon start 启动共享服务。网关不替换已有执行器或聊天。已有聊天的执行与审批操作绑定 `hostId + conversationId + ownerClientId`，由 App 中相应 owner 执行。重命名是独立的元数据操作，使用所选主机的短期官方运行时调用 `thread/name/set`，不加载执行任务、不调用 `turn/start`，也不改变 provider、认证或审批策略。
+手机网页控制 Codex App 聊天，并可在已保存项目中新建空聊天。Codex 页面内的 WSL 接入支持直接创建及恢复原生线程；明确创建或继续时可用已安装 Codex 的原生 daemon start 启动共享服务。网关不替换已有执行器或聊天。已有聊天的执行与审批操作绑定 `hostId + conversationId + ownerClientId`，由 App 中相应 owner 执行。手动重命名是独立的元数据操作，使用所选主机的短期官方运行时调用 `thread/name/set`，不加载执行任务、不调用 `turn/start`，也不改变 provider、认证或审批策略。
 
 默认继承已有会话的设置。显式选择模型时更新 `model`、`effort` 或速度档位。账号切换是独立的全局操作：仅桌面端添加凭据，双端选择已保存接入，退出官方桌面后替换本机认证及默认 provider，再启动核验。已有聊天的 provider 和审批策略不直接迁移；详情见 [账号与接入](docs/account-switching.md)。
 
@@ -58,7 +58,7 @@ Codex 列表下拉刷新使用浮层提示与按动画帧更新的位移，不�
 
 创建结果按 UUID 写入网关自己的 `creations.json`，重试复用同一聊天；请求可能提交但结果未知时不自动重放。辅助进程退出后，通过 `codex://threads/<id>?hostId=...` 打开原桌面 App，桌面接管后才允许发送和审批。此步骤会切换桌面当前页面；打开失败保留已创建 ID。SSH 创建借助已有非交互 SSH 通道执行相同辅助代码，不在远端安装网关。
 
-Codex 创建名称为可选字段，界面默认留空；缺省、空串或纯空格统一为空，只有手动名称才执行创建阶段的 `thread/name/set`。空名保持原生未命名状态，展示依次使用原生 `name`、内容 `preview` 和“未命名聊天”。CLI/WSL 接收 `thread/name/updated` 后刷新标题，并防止在途旧读取覆盖较新的名称。标题生成归原生客户端；Bridge 不创建标题临时会话、不发送额外模型请求，也不维护自动命名回执。详细契约与验证范围见[可选名称记录](.agents/notes/implemented/feature/2026-11-16-codex-optional-titles.md)。
+Codex 创建名称为可选字段，界面默认留空；缺省、空串或纯空格统一为空，只有手动名称才执行创建阶段的 `thread/name/set`。空名保持原生未命名状态，展示依次使用原生 `name`、内容 `preview` 和“未命名聊天”。CLI/WSL 接收 `thread/name/updated` 后刷新标题，并防止在途旧读取覆盖较新的名称。Bridge 新建的空标题 CLI/WSL 聊天在首条消息明确发送成功后，通过原执行接入创建隔离的临时模型任务，固定使用 `gpt-6-luna` 与 `low`，沿用原账号、provider 和 cwd，再核验原线程并写回名称。运行时或上游不支持该模型时，本次命名失败，不回退其他模型，主聊天发送和回复不受影响；App 聊天仍由原生 App 命名。共用任务回执保存在 `auto-titles.json`，被动读取和旧聊天不触发命名，未知生成或回写结果不重放。详细契约与验证范围见[可选名称记录](.agents/notes/implemented/feature/2026-11-16-codex-optional-titles.md)与[CLI 模型命名记录](.agents/notes/implemented/feature/2026-11-19-cli-model-titles.md)。
 
 CLI 运行时在新线程完整读取时明确返回 `list_turns is not supported yet`，可通过同一原生连接的元数据读取完成身份确认；该读取保留实时内容并标记历史尚未完整加载。新线程可在原生持久化库存到达前打开并接受显式首条发送。创建回执的已知 ID 与完成分开，pending 重试只读核验同一已加入的原生线程，核对原目录、provider、人工名称和模型后安装会话；不重新创建、改名、恢复线程或发送消息。原连接丢失时保留 pending；ready 回执在连接丢失后只有匹配的原生持久化元数据才可报告可读。新建和 CLI 恢复共用即时身份核验后的安装流程，独立入口仍拒绝 Desktop 来源。详情见 [CLI 空标题创建修复](.agents/notes/implemented/bug-fix/2026-11-18-cli-empty-chat-creation.md)。
 

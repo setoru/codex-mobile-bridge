@@ -77,7 +77,7 @@ class SharedServer:
             data.extend(block)
         return bytes(data)
 
-    def frame(self, data, opcode=1):
+    def frame(self, data, opcode=1, *, current_guard=None):
         if len(data) > self.LIMIT:
             raise IPCError('WSL 控制消息过大')
         size = len(data)
@@ -88,20 +88,30 @@ class SharedServer:
         with self.write_lock:
             if self.closed:
                 raise IPCError('WSL 控制通道已断开')
+            if current_guard is not None and not current_guard():
+                error = IPCError('原 WSL 控制连接已变化，操作未发送')
+                error.not_sent = True
+                raise error
             try:
                 self.stream.sendall(head + mask + bytes(v ^ mask[i % 4] for i, v in enumerate(data)))
             except OSError as exc:
                 raise IPCError('WSL 写入结果未确认，请检查原会话，不要重复提交') from exc
 
-    def write(self, value):
-        self.frame(json.dumps(value, ensure_ascii=False, separators=(',', ':')).encode('utf-8'))
+    def write(self, value, *, current_guard=None):
+        self.frame(json.dumps(value, ensure_ascii=False, separators=(',', ':')).encode('utf-8'),
+                   current_guard=current_guard)
 
-    def request(self, method, params, timeout=20):
+    def request(self, method, params, timeout=20, *, current_guard=None):
         if method not in self.METHODS:
             raise ValueError('不支持的 WSL 会话操作')
-        return self._request(method, params, timeout)
+        return self._request(method, params, timeout, current_guard=current_guard)
 
-    def _request(self, method, params, timeout):
+    def respond(self, request_id, result=None, error=None, *, current_guard=None):
+        """Reply on this captured stream only while its caller's identity is current."""
+        value = {'id': request_id, 'error': error} if error is not None else {'id': request_id, 'result': result}
+        self.write(value, current_guard=current_guard)
+
+    def _request(self, method, params, timeout, *, current_guard=None):
         with self.lock:
             if self.closed:
                 raise IPCError('WSL 控制通道已断开')
@@ -109,7 +119,7 @@ class SharedServer:
             identifier = self.counter
             future = self.pending[identifier] = Future()
         try:
-            self.write({'id': identifier, 'method': method, 'params': params})
+            self.write({'id': identifier, 'method': method, 'params': params}, current_guard=current_guard)
             response = future.result(timeout=timeout)
             if 'error' in response:
                 if method in ('thread/archive', 'thread/unarchive'):

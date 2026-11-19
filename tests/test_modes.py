@@ -1,10 +1,12 @@
 import copy
 import json
+import tempfile
 import threading
 import unittest
 import uuid
 from types import SimpleNamespace
-from unittest.mock import patch
+from pathlib import Path
+from unittest.mock import Mock, patch
 
 import test_bridge as support
 
@@ -13,6 +15,7 @@ from bridge.features.sessions.goal import GoalError, GoalUnavailable, GOAL_ACTIV
 from bridge.clients.codex.ipc import IPCError
 from bridge.features.sessions.model import desktop_file_attachments, normalize_item, normalize_request, normalize_state, user_display_text
 from bridge.features.sessions.timeline import Timeline
+from bridge.features.sessions.auto_titles import AutomaticTitles
 
 
 class GoalStub:
@@ -67,15 +70,22 @@ class GoalStub:
 
 class NativeGoalStateTests(unittest.TestCase):
     def test_main_chat_file_prompt_does_not_double_wrap_cli_runtime(self):
+        temporary = tempfile.TemporaryDirectory(dir=Path(__file__).resolve().parents[1]/'.tmp')
+        self.addCleanup(temporary.cleanup)
         files = [{'name': 'notes.txt', 'path': '/fixture/notes.txt', 'image': None},
                  {'name': 'photo.png', 'path': '/fixture/photo.png', 'image': 'image/png'}]
         for runtime in ('desktop', 'cli'):
             with self.subTest(runtime=runtime):
                 calls = []
+                title_runner = Mock(side_effect=AssertionError('No eligible title chat exists in this fixture'))
+                title_jobs = AutomaticTitles(Path(temporary.name)/runtime, title_runner)
+                self.addCleanup(title_jobs.close)
+                self.addCleanup(title_runner.assert_not_called)
                 bridge = SimpleNamespace(
                     uploads=SimpleNamespace(resolve=lambda *_: files),
                     _call=lambda _session, method, params, timeout: calls.append((method, params)) or {},
-                    submit_lock=threading.RLock(), submissions={}, _save_ledger=lambda: None)
+                    submit_lock=threading.RLock(), submissions={}, _save_ledger=lambda: None,
+                    lock=threading.RLock(), _auto_title_targets={}, auto_titles=title_jobs)
                 session = SimpleNamespace(id=THREAD, runtime=runtime,
                                           condition=threading.Condition(), changed=lambda: None)
                 identifier = str(uuid.uuid4())

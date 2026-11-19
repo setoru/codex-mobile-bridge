@@ -27,6 +27,8 @@ from bridge.clients.codex.ipc import DesktopIPC, IPCError
 from bridge.clients.errors import TaskStateUnavailable
 from bridge.clients.codex.app_server import AppServerError, AppServerUnavailable
 from bridge.clients.codex.cli_session import CliSessions
+from bridge.clients.codex.title_generation import TitleCancelled
+from bridge.features.sessions.auto_titles import AutomaticTitles, title_input
 from bridge.features.sessions.identity import same_cwd
 from bridge.clients.desktop_app import DesktopApp
 from bridge.clients.codex.transport import ipc_endpoint
@@ -337,6 +339,9 @@ class Bridge:
         self.creations = json.loads(self.creations_path.read_text(encoding='utf-8')) if self.creations_path.exists() else {}
         self.recovery_commands = RecoveryCommands(self.creations, self.create_lock, self._save_creations, self.host)
         self.submissions = json.loads(self.ledger_path.read_text(encoding='utf-8')) if self.ledger_path.exists() else {}
+        self.auto_titles = AutomaticTitles(self.data_dir, self._run_auto_title)
+        self._auto_title_targets = {}
+        self.cli_sessions.on_title_name = self._auto_title_name
         self.goal_commands_path = self.data_dir / 'goal-commands.json'
         self.goal_commands = json.loads(self.goal_commands_path.read_text(encoding='utf-8')) if self.goal_commands_path.exists() else {}
         self.goal_lock = threading.RLock()
@@ -686,6 +691,73 @@ class Bridge:
         target.chmod(0o600)
         target.replace(self.creations_path)
 
+    def _arm_auto_title(self, entry, request_id):
+        if not entry.get('autoTitle') or entry.get('title') or self.auto_titles.status(entry['id']) is not None:
+            return
+        home = self.cli_sessions.remote_home if self.cli_sessions.alias is not None else self.codex_home
+        if home is None:
+            return
+        identity = {'host': self.host, 'home': str(home), 'cwd': entry['runtimeCwd'],
+                    'modelProvider': entry['modelProvider'], 'origin': 'cli'}
+        if self.local:
+            account = codex_account_identity(self.codex_home, entry['modelProvider'])
+            if account:
+                identity['accountIdentity'] = account
+        try:
+            self.auto_titles.arm(entry['id'], request_id, identity)
+        except (OSError, ValueError):
+            logging.getLogger(__name__).warning('Automatic title registration unavailable')
+
+    @operation
+    def _auto_title_operation(self, identity, call):
+        if self.closed.is_set() or not self.observation_enabled() or identity.get('host') != self.host:
+            raise TitleCancelled('原 Codex 命名接入已关闭')
+        if self.local and identity.get('accountIdentity') and (
+                codex_account_identity(self.codex_home, identity['modelProvider']) != identity['accountIdentity']):
+            raise TitleCancelled('原 Codex 命名账号已变化')
+        return call()
+
+    def _run_auto_title(self, job, text, cancelled, progress):
+        with self.lock:
+            session = self.live.get(job['threadId'])
+            target = self._auto_title_targets.pop(job['threadId'], None)
+        if (session is None or not session.connected or session.runtime != 'cli' or
+                session.desktop_owner_probe == 'found'):
+            raise TitleCancelled('原 CLI 命名会话已变化')
+        return self.cli_sessions.run_title(
+            job, text, cancelled, progress, target=target, apply_guard=session.action_lock,
+            operate=lambda call: self._auto_title_operation(job['identity'], call),
+            source_current=lambda: (session.connected and session.runtime == 'cli' and
+                                     session.owner == 'cli:' + session.id and session.desktop_owner_probe != 'found'))
+
+    def _accept_auto_title(self, session, submission_id, text, target):
+        status = self.auto_titles.status(session.id)
+        if status is None or status['status'] != 'armed':
+            return
+        key = session.id + ':' + submission_id
+        with self.submit_lock:
+            earlier = any(previous != key and previous.startswith(session.id + ':') and
+                          row.get('status') in ('accepted', 'unknown')
+                          for previous, row in self.submissions.items())
+        if earlier:
+            # A lost title receipt cannot turn a later message into the first
+            # submission, including after a failed cancellation save.
+            self.auto_titles.cancel(session.id)
+            return
+        if target is None:
+            self.auto_titles.cancel(session.id)
+            return
+        with self.lock:
+            self._auto_title_targets[session.id] = target
+        if not self.auto_titles.accepted(session.id, submission_id, text):
+            with self.lock:
+                self._auto_title_targets.pop(session.id, None)
+
+    def _auto_title_name(self, identifier, name):
+        if self.auto_titles.observe_name(identifier, name):
+            with self.lock:
+                self._auto_title_targets.pop(identifier, None)
+
     def recover(self, thread_id, body=None, *, request_id=None):
         if body is None:
             return self.recovery_commands.read(thread_id, request_id)
@@ -738,6 +810,8 @@ class Bridge:
             state = self.cli_sessions.create(source['cwd'], on_start=started, on_created=created, **overrides)
             with self.cli_sessions.require_current(state['id']) as current:
                 self._install_created_cli_session(current, cwd=source['cwd'])
+            entry.update(autoTitle=True, runtimeCwd=source['cwd'], modelProvider=state['modelProvider'])
+            self._arm_auto_title(entry, entry['operationId'])
             return {'opened': False, 'message': '新聊天已创建',
                     'draftAccountIdentity': self._creation_draft_identity(entry['id'])}
         if self.local:
@@ -1059,6 +1133,8 @@ print(json.dumps(reply, ensure_ascii=False))
                 entry = {'project': project_key, 'title': title, 'kind': kind,
                          'cwd': project['cwd'], 'host': project['host'],
                          'directoryIdentity': project.get('directoryIdentity'), 'at': time.time()}
+                if kind == 'cli' and not title:
+                    entry['autoTitle'] = True
                 if model_options:
                     entry['modelOptions'] = model_options
                 self.creations[request_id] = entry
@@ -1146,6 +1222,7 @@ print(json.dumps(reply, ensure_ascii=False))
                 self._save_creations()
             if kind == 'cli':
                 self._complete_cli_creation(entry, cli_bridge, request_id, refresh=not created_now)
+                cli_bridge._arm_auto_title(entry, request_id)
             bridge = self.for_host(entry['host'])
             if isinstance(bridge.store, RemoteStore):
                 with bridge.store.lock:
@@ -1776,6 +1853,17 @@ print(json.dumps(reply, ensure_ascii=False))
         self.notification_event.set()
 
     def _cli_disconnected(self, thread_id=None):
+        if hasattr(self, 'auto_titles'):
+            if thread_id is None:
+                self.auto_titles.cancel_all()
+                with self.lock:
+                    self._auto_title_targets.clear()
+            else:
+                status = self.auto_titles.status(thread_id)
+                if status and status['status'] != 'armed':
+                    self.auto_titles.cancel(thread_id)
+                with self.lock:
+                    self._auto_title_targets.pop(thread_id, None)
         if not self.closed.is_set():
             logging.getLogger(__name__).info("Codex connection transition thread=%s cause=%s",
                                             thread_id or 'all', 'native_thread_revoked' if thread_id else 'native_proxy_disconnected')
@@ -1840,6 +1928,7 @@ print(json.dumps(reply, ensure_ascii=False))
                     for value in queued:
                         value['status'] = 'cancelled'
                     self._save_ledger()
+            self.auto_titles.cancel(sid)
             result = callback(stop)
             if result['status'] in ('released', 'detached'):
                 self.released_cli.set(sid, True)
@@ -2778,7 +2867,10 @@ print(json.dumps(reply, ensure_ascii=False))
                                  reason='desktop_ipc_disconnected')
 
     def suspend_observation(self):
-        """Release only desktop followers; native/CLI tasks and saved state survive."""
+        """Release followers and cancel only gateway-owned title work."""
+        self.auto_titles.cancel_all()
+        with self.lock:
+            self._auto_title_targets.clear()
         with self.ipc.connect_lock:
             self.ipc.close()
         for source in list(self.remote_bridges.values()):
@@ -3605,6 +3697,7 @@ print(json.dumps(reply, ensure_ascii=False))
         self._require_desktop_feature(thread_id)
         session = self.session(thread_id, attach=False, background=True)
         with session.action_lock:
+            self.auto_titles.cancel(thread_id)
             if isinstance(self.store, RemoteStore):
                 source = source_text('features/sessions/create.py')
                 source += '\nimport shutil\nhome=Path(os.environ.get("CODEX_HOME", str(Path.home()/".codex")))\n'
@@ -4159,19 +4252,35 @@ print(json.dumps(reply, ensure_ascii=False))
             request["collaborationMode"] = {"mode": "plan" if entry["workMode"] == "plan" else "default",
                                             "settings": {"model": model, "reasoning_effort": effort, "developer_instructions": None}}
         request["input"].extend({"type": "skill", "name": s["name"], "path": s["path"]} for s in entry.get("skills", []))
-        if entry["mode"] != "steer":
-            response = self._call(session, "thread-follower-start-turn", {
-                "turnStart": {"request": request, "context": {"inheritThreadSettings": True, **context}}}, timeout=90)
-        else:
-            response = self._call(session, "thread-follower-steer-turn", {
-                "input": request["input"], "clientUserMessageId": submission_id,
-                "restoreMessage": {"request": request, "context": context},
-                "attachments": context['attachments']}, timeout=30)
+        title_target = None
+        title_status = self.auto_titles.status(session.id)
+        if session.runtime == 'cli' and entry['mode'] != 'steer' and title_status and title_status['status'] == 'armed':
+            title_target = self.cli_sessions.title_target(session.id)
+        try:
+            if entry["mode"] != "steer":
+                response = self._call(session, "thread-follower-start-turn", {
+                    "turnStart": {"request": request, "context": {"inheritThreadSettings": True, **context}}}, timeout=90)
+            else:
+                response = self._call(session, "thread-follower-steer-turn", {
+                    "input": request["input"], "clientUserMessageId": submission_id,
+                    "restoreMessage": {"request": request, "context": context},
+                    "attachments": context['attachments']}, timeout=30)
+        except Exception:
+            # Unknown first submissions must not cause a later send or passive
+            # refresh to start a title task for different content.
+            self.auto_titles.cancel(session.id)
+            raise
         with self.submit_lock:
             self.submissions[key]["status"] = "accepted"
             self._save_ledger()
         with session.condition:
             session.changed()
+        if (session.runtime == 'cli' and entry['mode'] != 'steer' and
+                title_status and title_status['status'] == 'armed'):
+            self._accept_auto_title(session, submission_id, title_input(entry['text'], files), title_target)
+        elif (session.runtime != 'cli' or
+              entry['mode'] == 'steer' and title_status and title_status['status'] == 'armed'):
+            self.auto_titles.cancel(session.id)
         return {"status": "accepted", "id": submission_id, "result": response}
 
     @operation
@@ -4346,6 +4455,8 @@ print(json.dumps(reply, ensure_ascii=False))
 
     def assert_detachable(self):
         """Check gateway-owned work before removing an already disabled entry."""
+        if self.auto_titles.has_pending():
+            raise ValueError('此客户端有正在清理的命名任务，请稍后再移除')
         with self.submit_lock, self.create_lock, self.message_lock:
             for ledger in (self.submissions, self.creations, self.message_actions, self.goal_commands):
                 if any(row.get('status', row.get('state')) in ('queued', 'unknown', 'pending', 'sent', 'running')
@@ -4373,6 +4484,9 @@ print(json.dumps(reply, ensure_ascii=False))
             self._close()
 
     def _close(self):
+        self.auto_titles.close()
+        with self.lock:
+            self._auto_title_targets.clear()
         self.terminals.close()
         self.side_chats.close()
         if self.cli_access:

@@ -108,9 +108,18 @@ class CodexAppServer:
                 self.close()
                 raise
 
-    def _send(self, message):
+    def _send(self, message, *, expected_connection=None, current_guard=None):
         with self.write_lock:
-            transport = self.transport
+            with self.lock:
+                if (expected_connection is not None and
+                        (self.process is not expected_connection[0] or
+                         self.transport is not expected_connection[1])):
+                    raise AppServerUnavailable('Original Codex runtime connection is no longer current')
+                transport = self.transport
+            if current_guard is not None and not current_guard():
+                error = AppServerUnavailable('Original Codex source identity changed before sending')
+                error.not_sent = True
+                raise error
             if transport is None:
                 raise AppServerUnavailable('Codex app-server connection is closed')
             try:
@@ -118,7 +127,8 @@ class CodexAppServer:
             except (OSError, ValueError) as exc:
                 raise AppServerUnknownResult('Codex runtime connection failed; request result is unknown') from exc
 
-    def request(self, method, params=None, timeout=15, replay_safe=False):
+    def request(self, method, params=None, timeout=15, replay_safe=False, *, expected_connection=None,
+                current_guard=None):
         """Send one RPC. A failed write or lost response is never retried here."""
         with self.lock:
             request_id = self.next_id
@@ -126,13 +136,21 @@ class CodexAppServer:
             future = Future()
             self.pending[request_id] = future
         try:
-            self._send({'id': request_id, 'method': method, 'params': params or {}})
+            self._send({'id': request_id, 'method': method, 'params': params or {}},
+                       expected_connection=expected_connection, current_guard=current_guard)
             try:
                 response = future.result(timeout=timeout)
             except TimeoutError as exc:
                 if replay_safe:
                     raise AppServerUnavailable('Codex runtime read timed out') from exc
                 raise AppServerUnknownResult('Codex runtime response timed out; request may have completed') from exc
+            with self.lock:
+                if (expected_connection is not None and
+                        (self.process is not expected_connection[0] or
+                         self.transport is not expected_connection[1])):
+                    if replay_safe:
+                        raise AppServerUnavailable('Original Codex runtime connection is no longer current')
+                    raise AppServerUnknownResult('Codex connection changed before its result could be confirmed')
             if 'error' in response:
                 error = response['error']
                 if method == 'thread/delete' and isinstance(error, dict):
@@ -173,12 +191,14 @@ class CodexAppServer:
     def is_loaded(self, thread_id):
         return thread_id in self.loaded_threads()
 
-    def respond(self, request_id, result=None, error=None):
+    def respond(self, request_id, result=None, error=None, *, expected_connection=None, current_guard=None):
         """Return a decision to a server request only after the caller authorizes it."""
         if error is not None:
-            self._send({'id': request_id, 'error': error})
+            self._send({'id': request_id, 'error': error}, expected_connection=expected_connection,
+                       current_guard=current_guard)
         else:
-            self._send({'id': request_id, 'result': result})
+            self._send({'id': request_id, 'result': result}, expected_connection=expected_connection,
+                       current_guard=current_guard)
 
     def _read_loop(self, process, transport):
         try:
